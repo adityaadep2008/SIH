@@ -594,6 +594,92 @@ function updateStatisticsUI() {
   }
 }
 
+// --- RENDER BATCHING, DIRTY CHECKING & EVENT DEDUPLICATION ENGINE ---
+let logsRenderScheduled = false;
+let lastLogsFingerprint = '';
+
+function scheduleLogsRender(force = false) {
+  if (logsRenderScheduled) return;
+  logsRenderScheduled = true;
+  requestAnimationFrame(() => {
+    logsRenderScheduled = false;
+
+    if (APP_STATE.activeTab === 'dashboard') {
+      renderRecentLogsDashboard();
+    } else if (APP_STATE.activeTab === 'logs') {
+      const topLogs = APP_STATE.logs.slice(0, 10);
+      const fp = topLogs.map(l => `${l.time}:${l.robot}:${l.description}`).join('|');
+      if (force || fp !== lastLogsFingerprint) {
+        lastLogsFingerprint = fp;
+        renderLogsTable();
+      }
+    }
+  });
+}
+
+let tasksRenderScheduled = false;
+let lastTasksFingerprint = '';
+
+function scheduleTasksRender(force = false) {
+  if (tasksRenderScheduled) return;
+  tasksRenderScheduled = true;
+  requestAnimationFrame(() => {
+    tasksRenderScheduled = false;
+    updateTaskSummaryMetrics();
+
+    // Skip heavy DOM generation if the tasks tab is not active
+    if (APP_STATE.activeTab !== 'tasks') return;
+
+    const activeTasksSubset = APP_STATE.tasks.slice(0, 25);
+    const fp = activeTasksSubset.map(t => `${t.task_id}:${t.status}:${t.progress_pct}:${t.dwell_remaining}:${t.assigned_robot_id}`).join('|');
+    if (!force && fp === lastTasksFingerprint) {
+      return;
+    }
+    lastTasksFingerprint = fp;
+
+    if (APP_STATE.taskViewMode === 'table') {
+      renderTasksTable();
+    } else if (typeof renderTaskCards === 'function') {
+      renderTaskCards();
+    }
+  });
+}
+
+let sidebarRenderScheduled = false;
+let lastSidebarFingerprint = '';
+
+function scheduleSidebarRender(force = false) {
+  if (sidebarRenderScheduled) return;
+  sidebarRenderScheduled = true;
+  requestAnimationFrame(() => {
+    sidebarRenderScheduled = false;
+    if (APP_STATE.activeTab !== 'dashboard' && APP_STATE.activeTab !== 'map-view') return;
+
+    const fp = APP_STATE.robots.map(r => `${r.id}:${r.state}:${Math.round(r.battery)}:${r.taskId}:${r.speed}`).join('|');
+    if (!force && fp === lastSidebarFingerprint) return;
+    lastSidebarFingerprint = fp;
+
+    renderSidebarAmrCards();
+    updateUberDirectionCard();
+  });
+}
+
+const processedEventHashes = new Set();
+const processedEventHashQueue = [];
+const MAX_EVENT_HASH_CACHE = 500;
+
+function hasEventBeenProcessed(ev) {
+  const key = `${ev.timestamp || ''}:${ev.type || ''}:${ev.detail || ''}`;
+  if (processedEventHashes.has(key)) return true;
+  processedEventHashes.add(key);
+  processedEventHashQueue.push(key);
+  if (processedEventHashQueue.length > MAX_EVENT_HASH_CACHE) {
+    const oldest = processedEventHashQueue.shift();
+    processedEventHashes.delete(oldest);
+  }
+  return false;
+}
+
 // --- LOGGING ENGINE ---
 function addStructuredLog(robot, category, description, status = 'Success', chips = []) {
   if (APP_STATE.streamPaused) return;
@@ -611,12 +697,12 @@ function addStructuredLog(robot, category, description, status = 'Success', chip
   APP_STATE.logs.unshift(newLog);
   if (APP_STATE.logs.length > 200) APP_STATE.logs.pop();
 
-  renderLogsTable();
-  renderRecentLogsDashboard();
+  scheduleLogsRender();
 }
 
 // --- TELEMETRY BRIDGE CLIENT ---
 let telemetrySocket = null;
+let restPollingInterval = null;
 
 function updateConnectionStatus(isConnected, label) {
   const pill = document.querySelector('.fleet-status-pill');
@@ -656,6 +742,10 @@ function initTelemetryBridge() {
       telemetrySocket.onopen = () => {
         connected = true;
         APP_STATE.isLiveConnected = true;
+        if (restPollingInterval) {
+          clearInterval(restPollingInterval);
+          restPollingInterval = null;
+        }
         console.log(`[TelemetryBridge] Connected to ${wsUrls[idx]}`);
         updateConnectionStatus(true, wsUrls[idx]);
       };
@@ -690,6 +780,7 @@ function initTelemetryBridge() {
 }
 
 function startRestTelemetryPolling() {
+  if (restPollingInterval) return; // Prevent multiple concurrent polling timers
   const host = window.location.hostname || 'localhost';
   const endpoints = [
     '/fleet/dashboard_telemetry',
@@ -698,7 +789,7 @@ function startRestTelemetryPolling() {
   ];
   let epIdx = 0;
 
-  setInterval(async () => {
+  restPollingInterval = setInterval(async () => {
     try {
       const res = await fetch(endpoints[epIdx], { cache: 'no-store' });
       if (res.ok) {
@@ -794,19 +885,18 @@ function handleLiveTelemetryPayload(data) {
         APP_STATE.tasks.unshift(t);
       }
     }
-    renderTasksTable();
-    if (typeof renderTaskCards === 'function') renderTaskCards();
-    updateTaskSummaryMetrics();
+    scheduleTasksRender();
   }
 
   if (data.events && Array.isArray(data.events)) {
     for (const ev of data.events) {
-      if (ev.detail) parseRawBackendLogLine(ev.detail);
+      if (ev && ev.detail && !hasEventBeenProcessed(ev)) {
+        parseRawBackendLogLine(ev.detail);
+      }
     }
   }
 
-  renderSidebarAmrCards();
-  updateUberDirectionCard();
+  scheduleSidebarRender();
 }
 
 function parseRawBackendLogLine(line) {
@@ -873,6 +963,9 @@ function initNavigation() {
 
       setTimeout(() => {
         resizeActiveCanvases();
+        if (pageId === 'tasks') scheduleTasksRender(true);
+        if (pageId === 'logs') scheduleLogsRender(true);
+        if (pageId === 'dashboard' || pageId === 'map-view') scheduleSidebarRender(true);
       }, 50);
     });
   });
@@ -1539,6 +1632,7 @@ function generateRandomTaskFromNode() {
 function renderTasksTable() {
   const tbody = document.getElementById('tasks-table-body');
   if (!tbody) return;
+  if (APP_STATE.activeTab !== 'tasks') return;
 
   const search = document.getElementById('task-search-input')?.value.toLowerCase() || '';
   const filterRun = document.getElementById('task-filter-run')?.value || 'ALL';
@@ -1564,7 +1658,16 @@ function renderTasksTable() {
     return matchesRun && matchesSearch && matchesStatus && matchesPriority;
   });
 
-  tbody.innerHTML = filtered.map(t => {
+  // Limit DOM rows to top 25 tasks to prevent massive C++ DOM heap thrashing
+  const MAX_DISPLAY = 25;
+  const displayed = filtered.slice(0, MAX_DISPLAY);
+
+  const countElem = document.getElementById('task-table-count-info');
+  if (countElem) {
+    countElem.textContent = `Showing ${displayed.length} of ${filtered.length} tasks`;
+  }
+
+  tbody.innerHTML = displayed.map(t => {
     const badge = getStatusBadgeHTML(t.status);
     const prioColor = t.priority >= 80 ? '#dc2626' : t.priority >= 60 ? '#2563eb' : '#64748b';
 
@@ -1642,8 +1745,6 @@ function renderTasksTable() {
       </tr>
     `;
   }).join('');
-
-  if (APP_STATE.taskViewMode === 'cards') renderTaskCards();
 }
 
 function getStatusBadgeHTML(status) {
@@ -1810,6 +1911,7 @@ window.inspectTaskJSON = function(taskId) {
 function renderLogsTable() {
   const tbody = document.getElementById('logs-table-body');
   if (!tbody) return;
+  if (APP_STATE.activeTab !== 'logs') return;
 
   const search = document.getElementById('log-search-input')?.value.toLowerCase() || '';
   const robotFilter = document.getElementById('log-filter-robot')?.value || 'ALL';
@@ -1824,10 +1926,13 @@ function renderLogsTable() {
     return matchesSearch && matchesRobot && matchesCat && matchesSev;
   });
 
-  const countElem = document.getElementById('log-count-display');
-  if (countElem) countElem.textContent = `Showing ${filtered.length} of ${APP_STATE.logs.length} events`;
+  const MAX_LOGS_DISPLAY = 50;
+  const displayed = filtered.slice(0, MAX_LOGS_DISPLAY);
 
-  tbody.innerHTML = filtered.map(l => {
+  const countElem = document.getElementById('log-count-display');
+  if (countElem) countElem.textContent = `Showing ${displayed.length} of ${APP_STATE.logs.length} events`;
+
+  tbody.innerHTML = displayed.map(l => {
     const robotColor = ROBOT_COLOR_MAP[l.robot] || '#64748b';
     
     const chipsHTML = (l.chips && l.chips.length > 0) ? `
@@ -2113,13 +2218,26 @@ function exportLogsToCSV() {
   link.click();
 }
 
+let lastDrawTime = 0;
+const TARGET_FPS = 30;
+const FRAME_MIN_TIME = 1000 / TARGET_FPS;
+
 function animLoop(timestamp) {
+  requestAnimationFrame(animLoop);
+
+  // If document is in background/minimized, pause expensive canvas drawing
+  if (document.hidden) return;
+
+  const elapsed = timestamp - lastDrawTime;
+  if (elapsed < FRAME_MIN_TIME) return;
+
   const dt = Math.min((timestamp - lastAnimTime) / 1000, 0.1);
   lastAnimTime = timestamp;
+  lastDrawTime = timestamp - (elapsed % FRAME_MIN_TIME);
 
   updateSimulationEngine(dt);
 
-  if (dashCtx && dashCanvas) {
+  if (dashCtx && dashCanvas && APP_STATE.activeTab === 'dashboard') {
     const cWidth = dashCanvas.width / window.devicePixelRatio;
     const cHeight = dashCanvas.height / window.devicePixelRatio;
     drawWarehouseScene(dashCtx, cWidth, cHeight, APP_STATE.viewMode);
@@ -2130,8 +2248,6 @@ function animLoop(timestamp) {
     const cHeight = fullCanvas.height / window.devicePixelRatio;
     drawWarehouseScene(fullCtx, cWidth, cHeight, APP_STATE.viewMode);
   }
-
-  requestAnimationFrame(animLoop);
 }
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -2139,11 +2255,9 @@ window.addEventListener('DOMContentLoaded', () => {
   resizeActiveCanvases();
   setupTaskModal();
 
-  renderTasksTable();
-  renderLogsTable();
-  renderRecentLogsDashboard();
-  renderSidebarAmrCards();
   updateTaskSummaryMetrics();
+  renderSidebarAmrCards();
+  renderRecentLogsDashboard();
 
   // Ingest definitive real dataset runs
   loadDatasetTasksAndMetrics();

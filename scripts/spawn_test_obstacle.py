@@ -14,14 +14,9 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Auto-add local workspace packages to sys.path
-WORKSPACE_INSTALL = Path("/home/rtsws/amr_ws/install")
-if WORKSPACE_INSTALL.exists():
-    for sp in WORKSPACE_INSTALL.glob("**/site-packages"):
-        if str(sp) not in sys.path:
-            sys.path.insert(0, str(sp))
-
-
+# ==============================================================================
+# SELF-HEALING ENVIRONMENT & AUTO-DISCOVERY
+# ==============================================================================
 def detect_active_ros_environment() -> Dict[str, str]:
     """Scan active simulation processes to discover ROS_DOMAIN_ID and CycloneDDS settings."""
     env_vars = {}
@@ -33,7 +28,7 @@ def detect_active_ros_environment() -> Dict[str, str]:
                 if not cmdline_path.exists():
                     continue
                 cmdline = cmdline_path.read_text(errors="ignore")
-                if any(k in cmdline for k in ["robot_agent", "data_collection_node", "warehouse_map_node", "gz sim"]):
+                if any(k in cmdline for k in ["robot_agent", "data_collection_node", "warehouse_map_node", "gz sim", "whca_planner_node"]):
                     environ_path = p / "environ"
                     if environ_path.exists():
                         env_data = environ_path.read_bytes().split(b"\x00")
@@ -51,11 +46,34 @@ def detect_active_ros_environment() -> Dict[str, str]:
     return env_vars
 
 
-# Apply active simulation environment
-_detected_env = detect_active_ros_environment()
-for _k, _v in _detected_env.items():
-    if _k not in os.environ:
-        os.environ[_k] = _v
+WORKSPACE_INSTALL = Path("/home/rtsws/amr_ws/install")
+need_reexec = False
+
+# Ensure python path has workspace site-packages
+if WORKSPACE_INSTALL.exists():
+    for sp in sorted(WORKSPACE_INSTALL.glob("**/site-packages")):
+        if str(sp) not in sys.path:
+            sys.path.insert(0, str(sp))
+
+# Ensure dynamic linker finds interface shared libraries (.so)
+current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+lib_dirs = [str(p) for p in sorted(WORKSPACE_INSTALL.glob("**/lib")) if p.is_dir()]
+missing_libs = [d for d in lib_dirs if d not in current_ld]
+if missing_libs:
+    os.environ["LD_LIBRARY_PATH"] = ":".join(missing_libs + ([current_ld] if current_ld else []))
+    need_reexec = True
+
+detected_env = detect_active_ros_environment()
+for k, v in detected_env.items():
+    if os.environ.get(k) != v:
+        os.environ[k] = v
+        need_reexec = True
+
+# Re-execute process once if LD_LIBRARY_PATH or ROS_DOMAIN_ID changed so ld.so and rclpy pick it up
+if need_reexec and "AMR_OBSTACLE_REEXEC" not in os.environ:
+    os.environ["AMR_OBSTACLE_REEXEC"] = "1"
+    os.execvpe(sys.executable, [sys.executable] + sys.argv, os.environ)
+
 
 MODEL_PRESETS = {
     "pallet_boxes": "/home/rtsws/amr_ws/src/warehouse_world_custom/models/aws_robomaker_warehouse_ClutteringA_01/model.sdf",
@@ -167,24 +185,37 @@ def compute_lookahead_intersection(
 
 
 class TrajectoryListener:
-    """Listens to active ROS 2 RoutePlan and RobotState topics to find AMR trajectory."""
+    """Listens to active ROS 2 RoutePlan, Path, and RobotState topics to find AMR trajectory."""
 
     def __init__(self, target_robot: str, timeout_s: float):
         self.target_robot = target_robot
         self.timeout_s = timeout_s
         self.active_routes: Dict[str, List[Tuple[float, float]]] = {}
         self.active_poses: Dict[str, Tuple[float, float, float]] = {}
-        self.route_received = False
 
     def discover_target(self) -> Tuple[str, Optional[List[Tuple[float, float]]], Optional[Tuple[float, float, float]]]:
         """Spin briefly to capture live route and pose data."""
         try:
             import rclpy
             from rclpy.node import Node
-            from sih_amr_interfaces.msg import RoutePlan, RobotState
-        except ImportError:
-            print("[WARN] ROS 2 or sih_amr_interfaces not importable in current environment.")
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+        except ImportError as e:
+            print(f"[WARN] Failed to import rclpy ({e}). Falling back to chokepoints.")
             return self.target_robot, None, None
+
+        has_custom_msgs = False
+        try:
+            from sih_amr_interfaces.msg import RoutePlan, RobotState
+            has_custom_msgs = True
+        except ImportError:
+            pass
+
+        try:
+            from nav_msgs.msg import Path as NavPath, Odometry
+            from geometry_msgs.msg import PoseStamped
+        except ImportError:
+            NavPath = None
+            Odometry = None
 
         if not rclpy.ok():
             rclpy.init()
@@ -192,24 +223,70 @@ class TrajectoryListener:
         node = Node("targeted_obstacle_spawner_probe")
         candidate_robots = ["robot_1", "robot_2", "robot_3", "robot_4"] if self.target_robot == "auto" else [self.target_robot]
 
-        def make_route_cb(r_id):
-            def cb(msg: RoutePlan):
-                if msg.waypoints:
-                    pts = [(wp.x, wp.y) for wp in msg.waypoints]
-                    self.active_routes[r_id] = pts
-                    self.route_received = True
+        qos_transient = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL
+        )
+        qos_best_effort = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE
+        )
+
+        def make_routeplan_cb(r_id):
+            def cb(msg):
+                if hasattr(msg, "waypoints") and msg.waypoints:
+                    self.active_routes[r_id] = [(wp.x, wp.y) for wp in msg.waypoints]
             return cb
 
-        def on_fleet_state(msg: RobotState):
-            r_id = msg.fleet_header.robot_id
-            if r_id and msg.localization_valid:
+        def make_navpath_cb(r_id):
+            def cb(msg):
+                if hasattr(msg, "poses") and msg.poses:
+                    self.active_routes[r_id] = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+            return cb
+
+        def on_fleet_robot_state(msg):
+            r_id = getattr(getattr(msg, "fleet_header", None), "robot_id", "")
+            if r_id and getattr(msg, "localization_valid", False):
                 self.active_poses[r_id] = (msg.pose.x, msg.pose.y, msg.pose.theta)
 
-        # Create subscribers
+        def make_odom_cb(r_id):
+            def cb(msg):
+                px = msg.pose.pose.position.x
+                py = msg.pose.pose.position.y
+                qz = msg.pose.pose.orientation.z
+                qw = msg.pose.pose.orientation.w
+                yaw = 2.0 * math.atan2(qz, qw)
+                if r_id not in self.active_poses:
+                    self.active_poses[r_id] = (px, py, yaw)
+            return cb
+
         subs = []
         for r_id in candidate_robots:
-            subs.append(node.create_subscription(RoutePlan, f"/{r_id}/planned_route", make_route_cb(r_id), 10))
-        subs.append(node.create_subscription(RobotState, "/fleet/robot_state", on_fleet_state, 10))
+            if has_custom_msgs:
+                try:
+                    subs.append(node.create_subscription(RoutePlan, f"/{r_id}/planned_route", make_routeplan_cb(r_id), qos_transient))
+                except Exception:
+                    pass
+            if NavPath is not None:
+                try:
+                    subs.append(node.create_subscription(NavPath, f"/{r_id}/path", make_navpath_cb(r_id), qos_transient))
+                except Exception:
+                    pass
+            if Odometry is not None:
+                try:
+                    subs.append(node.create_subscription(Odometry, f"/{r_id}/odom", make_odom_cb(r_id), qos_best_effort))
+                except Exception:
+                    pass
+
+        if has_custom_msgs:
+            try:
+                subs.append(node.create_subscription(RobotState, "/fleet/robot_state", on_fleet_robot_state, qos_transient))
+            except Exception:
+                pass
 
         start_time = time.time()
         while time.time() - start_time < self.timeout_s:
@@ -218,7 +295,7 @@ class TrajectoryListener:
             if self.target_robot != "auto":
                 if self.target_robot in self.active_routes and self.target_robot in self.active_poses:
                     break
-            elif self.active_routes:
+            elif self.active_routes and self.active_poses:
                 break
 
         node.destroy_node()
@@ -226,7 +303,6 @@ class TrajectoryListener:
         # Resolve selected robot
         selected_robot = self.target_robot
         if self.target_robot == "auto":
-            # Pick first robot with active route, or first robot with pose
             if self.active_routes:
                 selected_robot = list(self.active_routes.keys())[0]
             elif self.active_poses:

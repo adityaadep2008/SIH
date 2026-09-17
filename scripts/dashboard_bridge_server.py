@@ -575,7 +575,7 @@ def build_ws_frame(payload_bytes: bytes) -> bytes:
 
 def broadcast_ws_telemetry():
     while True:
-        time.sleep(0.1)  # 10 Hz broadcast rate
+        time.sleep(0.2)  # 5 Hz adaptive broadcast rate (prevents network buffer & DOM saturation)
         with WS_LOCK:
             clients = list(CONNECTED_WS_CLIENTS)
         if not clients:
@@ -838,7 +838,14 @@ def main():
     # Graceful shutdown handler
     def handle_sigint(signum, frame):
         print("\n[DashboardBridge] Stopping server...")
-        sys.exit(0)
+        with WS_LOCK:
+            for client in list(CONNECTED_WS_CLIENTS):
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            CONNECTED_WS_CLIENTS.clear()
+        os._exit(0)
 
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
