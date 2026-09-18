@@ -299,7 +299,7 @@ def test_carrier_coalescing_dispatcher():
 
 
 def test_carrier_spatial_divergence_hold_and_recovery():
-    """Verify that persistent (>0.50m for 3 frames) Gazebo spatial error holds the AMR and 5 healthy frames release it."""
+    """Verify that >0.25m Gazebo spatial error holds the AMR and 5 healthy frames release it."""
     import rclpy
     from unittest.mock import MagicMock
     from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
@@ -315,15 +315,12 @@ def test_carrier_spatial_divergence_hold_and_recovery():
         r1.true_x = 0.0
         r1.true_y = 0.0
         r1.cmd_linear_x = 0.46
-        r1.divergence_hold = False
-        r1.consecutive_divergent_observations = 0
-        r1.consecutive_healthy_observations = 0
 
-        # Gazebo reports pose divergent by 0.60m (> 0.50m limit)
+        # Gazebo reports pose divergent by 0.30m (> 0.25m limit)
         mock_pose = MagicMock()
         mock_pose.name = 'robot_1/turtlebot4'
         mock_pose.id = 101
-        mock_pose.position.x = 0.60
+        mock_pose.position.x = 0.30
         mock_pose.position.y = 0.0
         mock_pose.orientation.x = 0.0
         mock_pose.orientation.y = 0.0
@@ -333,20 +330,8 @@ def test_carrier_spatial_divergence_hold_and_recovery():
         mock_msg = MagicMock()
         mock_msg.pose = [mock_pose]
 
-        # Frame 1: transient spike is debounced (does NOT hold yet)
-        node._on_gz_poses(mock_msg)
-        assert r1.divergence_hold is False
-        assert r1.consecutive_divergent_observations == 1
-
-        # Frame 2: still debounced
-        node._on_gz_poses(mock_msg)
-        assert r1.divergence_hold is False
-        assert r1.consecutive_divergent_observations == 2
-
-        # Frame 3: persistent divergence reaches trigger threshold -> holds AMR
         node._on_gz_poses(mock_msg)
         assert r1.divergence_hold is True
-        assert r1.consecutive_divergent_observations == 3
 
         # Next observations align closely (error 0.01m <= 0.05m)
         mock_pose.position.x = 0.01

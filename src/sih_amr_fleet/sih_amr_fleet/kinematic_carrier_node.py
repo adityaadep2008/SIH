@@ -88,7 +88,6 @@ class RobotKinematicState:
         self.last_gz_observed_time = -math.inf
         self.divergence_hold = False
         self.consecutive_healthy_observations = 0
-        self.consecutive_divergent_observations = 0
 
 
 class KinematicCarrierNode(Node):
@@ -101,10 +100,8 @@ class KinematicCarrierNode(Node):
         self.map_file = self.declare_parameter('map_file', '').value
         self.robot_radius = self.declare_parameter('robot_radius_m', 0.17).value
         self.update_rate_hz = self.declare_parameter('update_rate_hz', 50.0).value
-        self.gz_request_timeout_ms = self.declare_parameter('gz_request_timeout_ms', 250).value
+        self.gz_request_timeout_ms = self.declare_parameter('gz_request_timeout_ms', 150).value
         self.gz_dispatch_rate_hz = self.declare_parameter('gz_dispatch_rate_hz', 20.0).value
-        self.divergence_threshold_m = self.declare_parameter('divergence_threshold_m', 0.50).value
-        self.divergence_consecutive_trigger = self.declare_parameter('divergence_consecutive_trigger', 3).value
         
         # Odometry noise parameters - default 0.0 per user instruction
         self.odom_scale_error = self.declare_parameter('odom_scale_error', 0.0).value
@@ -305,28 +302,24 @@ class KinematicCarrierNode(Node):
                     robot.last_gz_observed_time = now
 
                     err_dist = math.hypot(robot.true_x - robot.gz_observed_x, robot.true_y - robot.gz_observed_y)
-                    if err_dist > self.divergence_threshold_m:
-                        robot.consecutive_divergent_observations += 1
+                    if err_dist > 0.25:
+                        if not robot.divergence_hold:
+                            robot.divergence_hold = True
+                            self.get_logger().warning(
+                                f'[Carrier] AMR {rid} held due to real divergence: '
+                                f'error={err_dist:.3f}m > 0.25m (true=({robot.true_x:.3f}, {robot.true_y:.3f}), '
+                                f'gz=({robot.gz_observed_x:.3f}, {robot.gz_observed_y:.3f}))',
+                                throttle_duration_sec=2.0
+                            )
                         robot.consecutive_healthy_observations = 0
-                        if robot.consecutive_divergent_observations >= self.divergence_consecutive_trigger:
-                            if not robot.divergence_hold:
-                                robot.divergence_hold = True
-                                self.get_logger().warning(
-                                    f'[Carrier] AMR {rid} held due to persistent divergence: '
-                                    f'error={err_dist:.3f}m > {self.divergence_threshold_m:.2f}m for {robot.consecutive_divergent_observations} frames '
-                                    f'(true=({robot.true_x:.3f}, {robot.true_y:.3f}), gz=({robot.gz_observed_x:.3f}, {robot.gz_observed_y:.3f}))',
-                                    throttle_duration_sec=2.0
-                                )
-                    else:
-                        robot.consecutive_divergent_observations = 0
-                        if err_dist <= 0.05:
-                            robot.consecutive_healthy_observations += 1
-                            if robot.divergence_hold and robot.consecutive_healthy_observations >= 5:
-                                robot.divergence_hold = False
-                                self.get_logger().info(
-                                    f'[Carrier] AMR {rid} divergence resolved (consecutive healthy observations >= 5). '
-                                    f'Resuming normal motion.'
-                                )
+                    elif err_dist <= 0.05:
+                        robot.consecutive_healthy_observations += 1
+                        if robot.divergence_hold and robot.consecutive_healthy_observations >= 5:
+                            robot.divergence_hold = False
+                            self.get_logger().info(
+                                f'[Carrier] AMR {rid} divergence resolved (consecutive healthy observations >= 5). '
+                                f'Resuming normal motion.'
+                            )
 
     def _is_position_collision_free(self, robot_id: str, x: float, y: float, curr_x: Optional[float] = None, curr_y: Optional[float] = None) -> bool:
         """Check if a circular footprint at (x, y) intersects shelves, walls, or other AMRs.
@@ -400,13 +393,13 @@ class KinematicCarrierNode(Node):
 
         for robot_id, robot in self.robots.items():
             # Check stale Gazebo pose feedback while in motion (wall time)
-            if robot.last_gz_observed_time > 0 and (now_wall - robot.last_gz_observed_time) > 3.0:
+            if robot.last_gz_observed_time > 0 and (now_wall - robot.last_gz_observed_time) > 2.0:
                 if abs(robot.cmd_linear_x) > 0.01 or abs(robot.cmd_angular_z) > 0.01:
                     if not robot.divergence_hold:
                         robot.divergence_hold = True
                         self.get_logger().warning(
                             f'[Carrier] AMR {robot_id} held due to stale Gazebo pose stream '
-                            f'({now_wall - robot.last_gz_observed_time:.2f}s > 3.0s)',
+                            f'({now_wall - robot.last_gz_observed_time:.2f}s > 2.0s)',
                             throttle_duration_sec=2.0
                         )
 
