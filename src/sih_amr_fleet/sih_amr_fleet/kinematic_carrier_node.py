@@ -411,10 +411,7 @@ class KinematicCarrierNode(Node):
                         )
 
             # Evaluate commanded velocity
-            if robot.divergence_hold:
-                v = 0.0
-                w = 0.0
-            elif now_s - robot.last_cmd_time > 0.5:
+            if now_s - robot.last_cmd_time > 0.5:
                 # Timeout commanded velocity
                 v = 0.0
                 w = 0.0

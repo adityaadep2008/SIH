@@ -1150,3 +1150,35 @@ def test_corridor_approach_cells_only_at_longitudinal_caps():
         node.destroy_node()
 
 
+def test_whca_directional_corridor_lane_separation():
+    """Verify that opposing traffic in the open vertical corridors routes into parallel lanes."""
+    import yaml
+    from sih_amr_fleet.map_geometry import map_geometry_from_data
+    from sih_amr_fleet.algorithms import whca_star
+
+    package_root = pathlib.Path(__file__).parents[1]
+    map_path = package_root.joinpath('maps/demo_warehouse.yaml')
+    data = yaml.safe_load(map_path.read_text())
+    res, width, height, ox, oy, blocked = map_geometry_from_data(data)
+
+    # Northbound in West Corridor: from y=20 to y=100
+    p_north = whca_star((33, 20), (33, 100), blocked, set(), width, height, horizon=20)
+    # Southbound in West Corridor: from y=100 to y=20
+    p_south = whca_star((33, 100), (33, 20), blocked, set(), width, height, horizon=20)
+
+    assert p_north, "Northbound route should be feasible"
+    assert p_south, "Southbound route should be feasible"
+
+    north_x = {cell[0] for cell in p_north}
+    south_x = {cell[0] for cell in p_south}
+
+    # Northbound should stay on East side (x >= 33)
+    assert min(north_x) >= 33, f"Northbound should use x >= 33, got {north_x}"
+    # Southbound should use West side (x <= 32)
+    assert max(south_x) <= 33, f"Southbound should use x <= 32 after departure, got {south_x}"
+    # Once traveling along the corridor, they must maintain separation
+    travel_south_x = {cell[0] for cell in p_south[3:]}
+    assert max(travel_south_x) <= 32, f"Southbound cruising cells should be <= 32, got {travel_south_x}"
+
+
+
