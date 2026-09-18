@@ -8,7 +8,7 @@ Runs sequential work-cycle benchmarks on Desktop (Ryzen 5 5600X + RTX 3070):
 - Consolidated robot agent processes (low CPU footprint)
 - DDS Domain IDs cycling in [10, 49]
 - Disjoint random seeds in [1000, 1059]
-- Auto-exports ML dataset CSV upon completion or interruption.
+- Use -d to rebuild the complete desktop ML dataset after collection.
 """
 
 import argparse
@@ -18,6 +18,7 @@ import os
 import queue
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -38,6 +39,17 @@ C_CYAN = "\033[36m"
 C_WHITE = "\033[37m"
 C_BG_BLUE = "\033[44m"
 C_BG_DARK = "\033[100m"
+
+
+def collection_log_root() -> Path:
+    """Return the shared, portable root for SIH collection artifacts."""
+    override = os.environ.get("SIH_DATA_LOG_DIR")
+    if override:
+        return Path(override).expanduser()
+    legacy_root = os.environ.get("AMR_WS_LOG_DIR")
+    if legacy_root:
+        return Path(legacy_root).expanduser() / "sih_data_collection"
+    return Path.home() / "amr_ws" / "log" / "sih_data_collection"
 
 RE_CBBA_BID = re.compile(
     r"\[(?P<robot>robot_\d):CBBA\]\s*Decision:\s*SUBMIT_BID for task (?P<task>[a-zA-Z0-9_-]+)"
@@ -500,14 +512,13 @@ def main():
     parser.add_argument("--seed", type=int, default=1000, help="Base random seed for Desktop")
     parser.add_argument("--timeout", type=int, default=3600, help="Per-run timeout seconds")
     parser.add_argument("--gui", action="store_true", default=False, help="Launch Gazebo with GUI enabled (default: headless)")
-    parser.add_argument("-o", "--output-csv", default="desktop_fleet_dataset.csv", help="Combined dataset CSV output filename")
+    repo_root = Path(__file__).resolve().parent.parent
+    parser.add_argument("-d", "--compile-dataset", action="store_true", help="Rebuild the complete desktop dataset from all saved desktop telemetry after the run")
+    parser.add_argument("-o", "--output-csv", default=str(repo_root / "collected_datasets_desktop.csv"), help="Dataset output path used with -d")
     args = parser.parse_args()
 
-    workspace_log = os.environ.get("AMR_WS_LOG_DIR")
-    if workspace_log:
-        base_dir = Path(workspace_log) / f"desktop_data_collection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    else:
-        base_dir = Path.home() / "amr_ws/log" / f"desktop_data_collection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_root = collection_log_root()
+    base_dir = log_root / f"desktop_data_collection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     base_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{C_BOLD}{C_GREEN}======================================================================{C_RESET}")
@@ -535,16 +546,21 @@ def main():
     except KeyboardInterrupt:
         print(f"\n{C_YELLOW}Interrupted by user. Halting simulation runs.{C_RESET}")
 
-    # Automatically generate the combined ML dataset CSV from all collected telemetry
-    if telemetry_files:
-        print(f"\n{C_BOLD}{C_CYAN}>>> Merging {len(telemetry_files)} telemetry log(s) into ML Dataset CSV: {args.output_csv} <<<{C_RESET}")
+    if args.compile_dataset:
+        telemetry_pattern = str(log_root / "desktop_data_collection_*" / "**" / "fleet_telemetry.jsonl")
+        print(f"\n{C_BOLD}{C_CYAN}>>> Rebuilding desktop ML dataset from all saved desktop telemetry: {args.output_csv} <<<{C_RESET}")
         script_dir = Path(__file__).resolve().parent
         gen_script = script_dir / "generate_ml_dataset.py"
         if gen_script.exists():
-            subprocess.run(["python3", str(gen_script)] + telemetry_files + ["--output", args.output_csv])
-            print(f"\n{C_BOLD}{C_GREEN}✔ Desktop Data Collection Finished: {passed}/{args.runs} runs completed ({len(telemetry_files)} telemetry logs saved to {args.output_csv}).{C_RESET}\n")
+            result = subprocess.run(["python3", str(gen_script), telemetry_pattern, "--output", args.output_csv])
+            output_csv = Path(args.output_csv)
+            if result.returncode == 0 and output_csv.exists():
+                shutil.copy2(output_csv, repo_root / "frontend" / "collected_datasets_desktop.csv")
+                print(f"\n{C_BOLD}{C_GREEN}✔ Desktop dataset rebuilt from all saved logs: {output_csv}{C_RESET}\n")
+            elif result.returncode != 0:
+                print(f"\n{C_RED}Dataset compilation failed with exit code {result.returncode}.{C_RESET}\n")
     else:
-        print(f"\n{C_YELLOW}No telemetry logs were recorded during this session.{C_RESET}\n")
+        print(f"\n{C_GREEN}✔ Desktop Data Collection Finished: {passed}/{args.runs} runs completed. Use -d to rebuild the full desktop dataset.{C_RESET}\n")
 
 
 if __name__ == "__main__":

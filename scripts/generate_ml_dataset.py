@@ -38,6 +38,19 @@ import sys
 from collections import defaultdict
 
 
+def default_log_root():
+    """Return the portable, canonical location for collected SIH telemetry."""
+    override = os.environ.get('SIH_DATA_LOG_DIR')
+    if override:
+        return pathlib.Path(override).expanduser()
+
+    legacy_root = os.environ.get('AMR_WS_LOG_DIR')
+    if legacy_root:
+        return pathlib.Path(legacy_root).expanduser() / 'sih_data_collection'
+
+    return pathlib.Path.home() / 'amr_ws' / 'log' / 'sih_data_collection'
+
+
 def compute_topological_distance(px, py, dx, dy):
     """Compute true warehouse topological path distance through aisle egress and main transit lanes."""
     start_zone = "South" if py < 0 else "North"
@@ -332,7 +345,7 @@ def parse_telemetry_to_dataset(jsonl_paths, output_csv_path):
 def main():
     parser = argparse.ArgumentParser(description='Generate Unified 22-Column Tabular ML Dataset.')
     parser.add_argument('telemetry_files', nargs='*', default=[], help='Paths or glob patterns to fleet_telemetry.jsonl files.')
-    parser.add_argument('--output', '-o', default='all_collected_dataset.csv', help='Output master ML CSV path.')
+    parser.add_argument('--output', '-o', default='collected_datasets.csv', help='Output master ML CSV path.')
     args = parser.parse_args()
 
     files = []
@@ -341,7 +354,7 @@ def main():
             matches = glob.glob(pattern, recursive=True) if '*' in pattern else [pattern]
             files.extend(matches)
     else:
-        files = sorted(pathlib.Path('/home/rtsws/amr_ws/log').rglob('fleet_telemetry.jsonl'))
+        files = sorted(default_log_root().rglob('fleet_telemetry.jsonl'))
         files = [str(f) for f in files]
 
     if not files:

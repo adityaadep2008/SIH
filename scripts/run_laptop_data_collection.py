@@ -6,7 +6,7 @@ Runs sequential work-cycle benchmarks on Laptop (60 FPS headless):
 - Standard 0.46 m/s physical_max velocity profile
 - Consolidated robot agent processes
 - DDS Domain IDs cycling in [60, 99]
-- Auto-exports ML dataset CSV upon completion.
+- Use -d to rebuild the complete laptop ML dataset after collection.
 """
 
 import argparse
@@ -36,6 +36,17 @@ C_CYAN = "\033[36m"
 C_WHITE = "\033[37m"
 C_BG_BLUE = "\033[44m"
 C_BG_DARK = "\033[100m"
+
+
+def collection_log_root() -> Path:
+    """Return the shared, portable root for SIH collection artifacts."""
+    override = os.environ.get("SIH_DATA_LOG_DIR")
+    if override:
+        return Path(override).expanduser()
+    legacy_root = os.environ.get("AMR_WS_LOG_DIR")
+    if legacy_root:
+        return Path(legacy_root).expanduser() / "sih_data_collection"
+    return Path.home() / "amr_ws" / "log" / "sih_data_collection"
 
 RE_CBBA_BID = re.compile(
     r"\[(?P<robot>robot_\d):CBBA\]\s*Decision:\s*SUBMIT_BID for task (?P<task>[a-zA-Z0-9_-]+)"
@@ -94,13 +105,23 @@ class TaskState:
 
 
 class LaptopCycleRun:
-    def __init__(self, run_index: int, total_runs: int, target_tasks: int, base_dir: Path, timeout_s: int, fleet_count: int = 4):
+    def __init__(
+        self,
+        run_index: int,
+        total_runs: int,
+        target_tasks: int,
+        base_dir: Path,
+        timeout_s: int,
+        fleet_count: int = 4,
+        gui: bool = False
+    ):
         self.run_index = run_index
         self.total_runs = total_runs
         self.target_tasks = target_tasks
         self.base_dir = base_dir
         self.timeout_s = timeout_s
         self.fleet_count = fleet_count
+        self.gui = gui
         self.run_id = f"laptop_run_{run_index:03d}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.log_dir = base_dir / self.run_id
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -201,6 +222,22 @@ class LaptopCycleRun:
         m = RE_FLEET_DONE.search(line)
         if m:
             self.print_stage_event("🚀", C_GREEN, "FLEET READY", f"All {self.fleet_count} AMRs online! Starting task generation & CBBA auction...")
+            return
+
+        if "[GAZEBO POSE OK]" in line:
+            self.print_stage_event("⚓", C_GREEN, "POSE VERIFIED", line.split("[GAZEBO POSE OK]")[-1].strip())
+            return
+
+        if "[GAZEBO POSE MISMATCH]" in line:
+            self.print_stage_event("✖", C_RED, "POSE MISMATCH", line.split("[GAZEBO POSE MISMATCH]")[-1].strip())
+            return
+
+        if "[GAZEBO POSE TIMEOUT]" in line:
+            self.print_stage_event("✖", C_RED, "POSE TIMEOUT", line.split("[GAZEBO POSE TIMEOUT]")[-1].strip())
+            return
+
+        if "Verifying" in line and "Gazebo" in line:
+            self.print_stage_event("🔍", C_CYAN, "VERIFYING POSE", line.strip())
             return
 
         if "ERROR:" in line or "fail" in line.lower():
@@ -312,7 +349,7 @@ class LaptopCycleRun:
         self.start_time = time.time()
         
         env = os.environ.copy()
-        env["START_GUI"] = "false"
+        env["START_GUI"] = "true" if self.gui else "false"
         env["START_FLEET"] = "true"
         env["FLEET_RANDOM_TASKS"] = "true"
         env["FLEET_RECORD_DATA"] = "true"
@@ -470,14 +507,14 @@ def main():
     parser.add_argument("-f", "--fleet-size", type=int, default=4, help="Fleet AMR count")
     parser.add_argument("--seed", type=int, default=2000, help="Base random seed for Laptop")
     parser.add_argument("--timeout", type=int, default=3600, help="Per-run timeout seconds")
-    parser.add_argument("-o", "--output-csv", default="laptop_fleet_dataset.csv", help="Combined dataset CSV output name")
+    parser.add_argument("--gui", action="store_true", default=False, help="Launch Gazebo with GUI enabled (default: headless)")
+    repo_root = Path(__file__).resolve().parent.parent
+    parser.add_argument("-d", "--compile-dataset", action="store_true", help="Rebuild the complete laptop dataset from all saved laptop telemetry after the run")
+    parser.add_argument("-o", "--output-csv", default=str(repo_root / "collected_datasets_laptop.csv"), help="Dataset output path used with -d")
     args = parser.parse_args()
 
-    workspace_log = os.environ.get("AMR_WS_LOG_DIR")
-    if workspace_log:
-        base_dir = Path(workspace_log) / f"laptop_data_collection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    else:
-        base_dir = Path.home() / "amr_ws/log" / f"laptop_data_collection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_root = collection_log_root()
+    base_dir = log_root / f"laptop_data_collection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     base_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{C_BOLD}{C_GREEN}======================================================================{C_RESET}")
@@ -490,7 +527,10 @@ def main():
 
     try:
         for idx in range(1, args.runs + 1):
-            run = LaptopCycleRun(idx, args.runs, args.tasks, base_dir, args.timeout, fleet_count=args.fleet_size)
+            run = LaptopCycleRun(
+                idx, args.runs, args.tasks, base_dir, args.timeout,
+                fleet_count=args.fleet_size, gui=args.gui
+            )
             success = run.execute(tracking_speed=args.speed, settle_s=3, seed=args.seed)
             if run.telemetry_file.exists() and run.telemetry_file.stat().st_size > 0:
                 telemetry_files.append(str(run.telemetry_file))
@@ -502,16 +542,19 @@ def main():
     except KeyboardInterrupt:
         print(f"\n{C_YELLOW}Interrupted by user. Halting simulation runs.{C_RESET}")
 
-    # Automatically generate the combined ML dataset CSV
-    if telemetry_files:
-        print(f"\n{C_BOLD}{C_CYAN}>>> Merging {len(telemetry_files)} telemetry log(s) into ML Dataset CSV: {args.output_csv} <<<{C_RESET}")
+    if args.compile_dataset:
+        telemetry_pattern = str(log_root / "laptop_data_collection_*" / "**" / "fleet_telemetry.jsonl")
+        print(f"\n{C_BOLD}{C_CYAN}>>> Rebuilding laptop ML dataset from all saved laptop telemetry: {args.output_csv} <<<{C_RESET}")
         script_dir = Path(__file__).resolve().parent
         gen_script = script_dir / "generate_ml_dataset.py"
         if gen_script.exists():
-            subprocess.run(["python3", str(gen_script)] + telemetry_files + ["--output", args.output_csv])
-            print(f"\n{C_BOLD}{C_GREEN}✔ Laptop Data Collection Finished: {passed}/{args.runs} runs completed ({len(telemetry_files)} telemetry logs saved to {args.output_csv}).{C_RESET}\n")
+            result = subprocess.run(["python3", str(gen_script), telemetry_pattern, "--output", args.output_csv])
+            if result.returncode == 0 and Path(args.output_csv).exists():
+                print(f"\n{C_BOLD}{C_GREEN}✔ Laptop dataset rebuilt from all saved logs: {args.output_csv}{C_RESET}\n")
+            elif result.returncode != 0:
+                print(f"\n{C_RED}Dataset compilation failed with exit code {result.returncode}.{C_RESET}\n")
     else:
-        print(f"\n{C_YELLOW}No telemetry logs were recorded during this session.{C_RESET}\n")
+        print(f"\n{C_GREEN}✔ Laptop Data Collection Finished: {passed}/{args.runs} runs completed. Use -d to rebuild the full laptop dataset.{C_RESET}\n")
 
 
 if __name__ == "__main__":
