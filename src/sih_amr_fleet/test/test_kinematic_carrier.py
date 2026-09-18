@@ -207,4 +207,148 @@ def test_boundary_inward_recovery_and_rejections():
             rclpy.shutdown()
 
 
+def test_carrier_gz_dispatch_metrics_and_timeout():
+    """Verify separate tracking of success, rejection, timeout, and latency in carrier dispatch."""
+    import rclpy
+    from unittest.mock import MagicMock
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode, GzPose_V
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        node.gz_node = MagicMock()
+
+        # 1. Successful request
+        node.gz_node.request.return_value = (True, MagicMock(data=True))
+        pv = GzPose_V() if GzPose_V else MagicMock()
+        node._dispatch_gz_pose(pv)
+
+        assert node.gz_sync_total_count == 1
+        assert node.gz_sync_success_count == 1
+        assert node.gz_sync_error_count == 0
+        assert node.last_gz_latency_ms >= 0.0
+
+        # 2. Timeout request (res=False, rep=None)
+        node.gz_node.request.return_value = (False, None)
+        node._dispatch_gz_pose(pv)
+
+        assert node.gz_sync_total_count == 2
+        assert node.gz_sync_timeout_count == 1
+        assert node.gz_sync_error_count == 1
+
+        # 3. Server rejection (res=True, rep.data=False)
+        node.gz_node.request.return_value = (True, MagicMock(data=False))
+        node._dispatch_gz_pose(pv)
+
+        assert node.gz_sync_total_count == 3
+        assert node.gz_sync_rejected_count == 1
+        assert node.gz_sync_error_count == 2
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_carrier_coalescing_dispatcher():
+    """Verify that in-flight requests cause new snapshots to coalesce rather than queue or block."""
+    import rclpy
+    from unittest.mock import MagicMock
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        node.gz_node = MagicMock()
+        mock_pose_vec = MagicMock()
+        mock_pose_vec.pose = [MagicMock()]
+        node.latest_gz_pose_vector = mock_pose_vec
+
+        # Simulate an in-flight future that is not done
+        in_flight_future = MagicMock()
+        in_flight_future.done.return_value = False
+        node.gz_future = in_flight_future
+
+        # Dispatch tick occurs
+        node._gz_dispatch_step()
+
+        # Snapshot was coalesced into latest buffer without starting a second concurrent request
+        assert node.gz_coalesced_count == 1
+        assert node.latest_gz_pose_vector is mock_pose_vec
+
+        # Simulate future completion
+        in_flight_future.done.return_value = True
+        node._gz_dispatch_step()
+
+        # Latest batch was submitted and cleared
+        assert node.latest_gz_pose_vector is None
+        assert node.gz_future is not in_flight_future
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_carrier_spatial_divergence_hold_and_recovery():
+    """Verify that >0.25m Gazebo spatial error holds the AMR and 5 healthy frames release it."""
+    import rclpy
+    from unittest.mock import MagicMock
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        r1 = node.robots['robot_1']
+        r1.true_x = 0.0
+        r1.true_y = 0.0
+        r1.cmd_linear_x = 0.46
+
+        # Gazebo reports pose divergent by 0.30m (> 0.25m limit)
+        mock_pose = MagicMock()
+        mock_pose.name = 'robot_1/turtlebot4'
+        mock_pose.id = 101
+        mock_pose.position.x = 0.30
+        mock_pose.position.y = 0.0
+        mock_pose.orientation.x = 0.0
+        mock_pose.orientation.y = 0.0
+        mock_pose.orientation.z = 0.0
+        mock_pose.orientation.w = 1.0
+
+        mock_msg = MagicMock()
+        mock_msg.pose = [mock_pose]
+
+        node._on_gz_poses(mock_msg)
+        assert r1.divergence_hold is True
+
+        # Next observations align closely (error 0.01m <= 0.05m)
+        mock_pose.position.x = 0.01
+        for i in range(4):
+            node._on_gz_poses(mock_msg)
+            # Still held until 5 consecutive healthy observations
+            assert r1.divergence_hold is True
+
+        # 5th healthy observation releases the hold
+        node._on_gz_poses(mock_msg)
+        assert r1.divergence_hold is False
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+
 
