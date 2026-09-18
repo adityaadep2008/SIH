@@ -196,44 +196,37 @@ def parse_telemetry_to_dataset(jsonl_paths, output_csv_path):
             start_zone = "South" if py < -5.0 else ("North" if py > 5.0 else "Central")
             goal_zone = "South" if dy < -5.0 else ("North" if dy > 5.0 else "Central")
 
-            # 1. Static Path Length & Turns (with robust fallback for truncated routes)
-            topo_len, topo_turns, topo_junctions = compute_topological_distance(px, py, dx, dy)
+            # 1. Static Path Length & Turns
             if tid in task_routes and len(task_routes[tid]) >= 2:
                 wps = task_routes[tid]
-                exec_len = sum(
+                path_len = sum(
                     math.hypot(wps[i+1][0] - wps[i][0], wps[i+1][1] - wps[i][1])
                     for i in range(len(wps) - 1)
                 )
-                exec_len = round(exec_len, 2)
-                # If recorded route length is plausible (>= 60% of topological distance), use it;
-                # otherwise only the final rolling-horizon horizon was retained, so use topological distance
-                if exec_len >= 0.6 * topo_len:
-                    path_len = exec_len
-                    turns = 0
-                    for i in range(len(wps) - 2):
-                        dx1, dy1 = wps[i+1][0] - wps[i][0], wps[i+1][1] - wps[i][1]
-                        dx2, dy2 = wps[i+2][0] - wps[i+1][0], wps[i+2][1] - wps[i+1][1]
-                        angle1 = math.atan2(dy1, dx1)
-                        angle2 = math.atan2(dy2, dx2)
-                        diff = abs((angle2 - angle1 + math.pi) % (2 * math.pi) - math.pi)
-                        if diff > 0.6:  # > 35 degrees
-                            turns += 1
-                    junction_crossings = 2 if start_zone != goal_zone else (1 if abs(dx - px) > 10.0 else 0)
-                else:
-                    path_len, turns, junction_crossings = topo_len, topo_turns, topo_junctions
+                path_len = round(path_len, 2)
+                turns = 0
+                for i in range(len(wps) - 2):
+                    dx1, dy1 = wps[i+1][0] - wps[i][0], wps[i+1][1] - wps[i][1]
+                    dx2, dy2 = wps[i+2][0] - wps[i+1][0], wps[i+2][1] - wps[i+1][1]
+                    angle1 = math.atan2(dy1, dx1)
+                    angle2 = math.atan2(dy2, dx2)
+                    diff = abs((angle2 - angle1 + math.pi) % (2 * math.pi) - math.pi)
+                    if diff > 0.6:  # > 35 degrees
+                        turns += 1
+                junction_crossings = 2 if start_zone != goal_zone else (1 if abs(dx - px) > 10.0 else 0)
             else:
-                path_len, turns, junction_crossings = topo_len, topo_turns, topo_junctions
+                path_len, turns, junction_crossings = compute_topological_distance(px, py, dx, dy)
 
             # 2. Candidate Corridor Count
             candidate_corridors = 2 if start_zone != goal_zone else 1
 
-            # 3. Spatial Density & Nearby Robot Speed at Decision Time [t_start - 2.0, t_start]
+            # 3. Spatial Density & Nearby Robot Speed
             nearby_counts = []
             nearby_speeds = []
-            start_b = round((t_start - 2.0) * 2) / 2.0
-            bid_b = round(t_start * 2) / 2.0
+            start_b = round(t_start * 2) / 2.0
+            end_b = round(t_end * 2) / 2.0
             cur_b = start_b
-            while cur_b <= bid_b:
+            while cur_b <= end_b:
                 states = robot_state_by_time.get(cur_b, [])
                 this_pos = next(((x, y) for (rid, x, y, spd) in states if rid == robot_id), None)
                 if this_pos:
@@ -243,31 +236,26 @@ def parse_telemetry_to_dataset(jsonl_paths, output_csv_path):
                             nearby_speeds.append(ospd)
                     cnt = sum(1 for (rid, ox, oy, ospd) in states if rid != robot_id and math.hypot(ox - tx, oy - ty) <= 3.5)
                     nearby_counts.append(cnt)
-                cur_b += 0.5
+                cur_b += 1.0
 
             mean_nearby = round(sum(nearby_counts) / max(1, len(nearby_counts)), 2) if nearby_counts else 0.0
             avg_nearby_spd = round(sum(nearby_speeds) / max(1, len(nearby_speeds)), 2) if nearby_speeds else round(nominal_speed * 0.4, 2)
 
-            # 4. Corridor Reservations, Queue & Occupancy Ratio at Decision Time
-            # Look only at events up to bid time t_start
-            res_events_at_bid = [
+            # 4. Corridor Reservations, Queue & Occupancy Ratio
+            res_events_in_window = [
                 (t_ev, cid, r_ev, ev) for (t_ev, cid, r_ev, ev) in corridor_events
-                if t_start - 10.0 <= t_ev <= t_start
+                if t_start - 2.0 <= t_ev <= t_end + 2.0
             ]
-            reservation_count = len(res_events_at_bid)
+            reservation_count = len(res_events_in_window)
             
-            # Queue: maximum concurrent distinct peer robots reserving any single corridor
-            peer_res_by_cid = defaultdict(set)
-            for (t_ev, cid, r_ev, ev) in res_events_at_bid:
-                if r_ev != robot_id:
-                    peer_res_by_cid[cid].add(r_ev)
-            max_queue = max([len(peers) for peers in peer_res_by_cid.values()], default=0)
+            peer_res = [cid for (t_ev, cid, r_ev, ev) in res_events_in_window if r_ev != robot_id]
+            max_queue = max(1, len(set(peer_res)))
 
-            # Corridor occupancy ratio: fraction of time other robots reserved candidate corridors in [t_start - 10, t_start]
-            candidate_res_events = [t_ev for (t_ev, cid, r_ev, ev) in res_events_at_bid if r_ev != robot_id]
-            corridor_occupancy_ratio = min(1.0, round(len(candidate_res_events) * 2.0 / 10.0, 3))
+            # Corridor occupancy ratio: fraction of time other robots reserved candidate corridors
+            candidate_res_events = [t_ev for (t_ev, cid, r_ev, ev) in res_events_in_window if r_ev != robot_id]
+            corridor_occupancy_ratio = min(1.0, round(len(candidate_res_events) * 2.0 / max(1.0, duration), 3))
 
-            # 5. Stop Time & Waiting Time (Execution outcome target / post-hoc metrics)
+            # 5. Stop Time & Waiting Time
             my_timeline = [
                 (ts, spd) for (ts, rx, ry, spd) in robot_states_timeline.get(robot_id, [])
                 if t_start <= ts <= t_end
@@ -285,30 +273,30 @@ def parse_telemetry_to_dataset(jsonl_paths, output_csv_path):
             p_dwell, d_dwell = task_dwells.get(tid, (1.0, 1.0))
             waiting_time = round(min(duration, total_stop_time + (p_dwell + d_dwell)), 2)
 
-            # 6. Active Dynamic Blockage Count at Bid Time
+            # 6. Active Dynamic Blockage Count in window
             active_blockages = sum(
                 1 for (t_obs, t_valid) in blockage_intervals
-                if t_obs <= t_start <= t_valid
+                if max(t_start, t_obs) <= min(t_end, t_valid)
             )
 
-            # 7. Mean Peer Telemetry Freshness at Bid Time (ms)
+            # 7. Mean Peer Telemetry Freshness (ms)
             intervals_ms = []
             for other_rid, t_stamps in robot_state_timestamps.items():
                 if other_rid == robot_id:
                     continue
-                bid_stamps = [ts for ts in t_stamps if t_start - 5.0 <= ts <= t_start]
-                if len(bid_stamps) >= 2:
-                    diffs = [(bid_stamps[i+1] - bid_stamps[i]) * 1000.0 for i in range(len(bid_stamps) - 1)]
+                window_stamps = [ts for ts in t_stamps if t_start <= ts <= t_end]
+                if len(window_stamps) >= 2:
+                    diffs = [(window_stamps[i+1] - window_stamps[i]) * 1000.0 for i in range(len(window_stamps) - 1)]
                     intervals_ms.extend(diffs)
 
             mean_freshness = round(sum(intervals_ms) / len(intervals_ms), 1) if intervals_ms else 100.0
             mean_freshness = min(500.0, max(50.0, mean_freshness))
 
-            # 8. Concurrent Task Load Count at Bid Time
+            # 8. Concurrent Task Load Count
             concurrent_tasks = sum(
                 1 for (other_tid, (ot_start, _)) in task_starts.items()
-                if other_tid != tid and ot_start <= t_start
-                and (other_tid not in task_completions or task_completions[other_tid][0] >= t_start)
+                if other_tid != tid and other_tid in task_completions
+                and not (task_completions[other_tid][0] < t_start or ot_start > t_end)
             )
 
             all_dataset_rows.append({

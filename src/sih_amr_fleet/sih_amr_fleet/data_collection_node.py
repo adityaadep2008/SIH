@@ -311,7 +311,6 @@ class DataCollectionNode(Node):
                     break
             if matched_robot:
                 roll, pitch, yaw = quaternion_to_euler(p.orientation)
-                now_s = now_seconds(self)
                 self.gazebo_ground_truth_poses[matched_robot] = {
                     'x': round(float(p.position.x), 4),
                     'y': round(float(p.position.y), 4),
@@ -320,7 +319,6 @@ class DataCollectionNode(Node):
                     'pitch': round(float(pitch), 4),
                     'yaw': round(float(yaw), 4),
                     'tilt': round(float(math.hypot(roll, pitch)), 4),
-                    'observed_at': now_s,
                 }
 
     def compute_pose_error(self, map_pose, gz_pose):
@@ -329,15 +327,12 @@ class DataCollectionNode(Node):
         dx = float(map_pose.x) - float(gz_pose['x'])
         dy = float(map_pose.y) - float(gz_pose['y'])
         dyaw = wrap_angle(float(map_pose.theta) - float(gz_pose['yaw']))
-        now_s = now_seconds(self)
-        gz_age = round(now_s - gz_pose.get('observed_at', now_s), 4) if 'observed_at' in gz_pose else None
         return {
             'error_xy_m': round(math.hypot(dx, dy), 4),
             'error_x_m': round(dx, 4),
             'error_y_m': round(dy, 4),
             'error_yaw_rad': round(dyaw, 4),
             'is_tilted': bool(gz_pose.get('tilt', 0.0) > 0.15),
-            'gz_pose_age_s': gz_age,
         }
 
     def write_record(self, record):

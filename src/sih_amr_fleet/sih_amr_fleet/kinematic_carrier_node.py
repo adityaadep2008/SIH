@@ -30,10 +30,7 @@ from sih_amr_interfaces.msg import DockProtocol, FleetHeader, RobotState
 
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from .algorithms import body_velocity_to_map
-from .common import (
-    FLEET_STATE_QOS, POSE_QOS, PROTOCOL_QOS, header, new_session_id, now_seconds,
-    quaternion_to_euler, wrap_angle
-)
+from .common import FLEET_STATE_QOS, POSE_QOS, PROTOCOL_QOS, header, new_session_id, now_seconds, wrap_angle
 from .map_geometry import map_geometry_from_data
 
 ODOM_QOS = QoSProfile(
@@ -81,14 +78,6 @@ class RobotKinematicState:
         self.dock_confirmed = False
         self.current_dock_id = None
 
-        # Gazebo pose observation and divergence tracking
-        self.gz_observed_x = x
-        self.gz_observed_y = y
-        self.gz_observed_yaw = yaw
-        self.last_gz_observed_time = -math.inf
-        self.divergence_hold = False
-        self.consecutive_healthy_observations = 0
-
 
 class KinematicCarrierNode(Node):
     """Centralized simulation-side carrier driver and sensor synthesizer."""
@@ -100,8 +89,6 @@ class KinematicCarrierNode(Node):
         self.map_file = self.declare_parameter('map_file', '').value
         self.robot_radius = self.declare_parameter('robot_radius_m', 0.17).value
         self.update_rate_hz = self.declare_parameter('update_rate_hz', 50.0).value
-        self.gz_request_timeout_ms = self.declare_parameter('gz_request_timeout_ms', 150).value
-        self.gz_dispatch_rate_hz = self.declare_parameter('gz_dispatch_rate_hz', 20.0).value
         
         # Odometry noise parameters - default 0.0 per user instruction
         self.odom_scale_error = self.declare_parameter('odom_scale_error', 0.0).value
@@ -112,17 +99,11 @@ class KinematicCarrierNode(Node):
         self.session_id = new_session_id()
         self.telemetry_sequence = 0
         self.gz_sync_total_count = 0
-        self.gz_sync_success_count = 0
-        self.gz_sync_timeout_count = 0
-        self.gz_sync_rejected_count = 0
-        self.gz_sync_exception_count = 0
         self.gz_sync_error_count = 0
-        self.gz_coalesced_count = 0
         self.last_gz_latency_ms = 0.0
         self.max_gz_latency_ms = 0.0
         self.gz_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.gz_future = None
-        self.latest_gz_pose_vector = None
         
         # Load map geometry for swept footprint collision checking
         self.map_resolution = 0.5
@@ -207,14 +188,9 @@ class KinematicCarrierNode(Node):
         # 50 Hz simulation tick timer
         timer_period = 1.0 / max(1.0, self.update_rate_hz)
         self.create_timer(timer_period, self._simulation_step)
-
-        # Decoupled 20 Hz Gazebo batch pose dispatch timer
-        gz_timer_period = 1.0 / max(1.0, float(self.gz_dispatch_rate_hz))
-        self.create_timer(gz_timer_period, self._gz_dispatch_step)
         
         self.get_logger().info(
-            f'KinematicCarrierNode active for {len(self.robots)} AMRs at {self.update_rate_hz} Hz '
-            f'(Gazebo sync at {self.gz_dispatch_rate_hz} Hz, timeout={self.gz_request_timeout_ms} ms). '
+            f'KinematicCarrierNode active for {len(self.robots)} AMRs at {self.update_rate_hz} Hz. '
             f'Odom noise={self.odom_noise_std}, scale_error={self.odom_scale_error}, gyro_drift={self.gyro_drift_rate}'
         )
 
@@ -286,40 +262,13 @@ class KinematicCarrierNode(Node):
         self.last_sim_time = sim_s
 
     def _on_gz_poses(self, msg: GzPose_V):
-        """Cache Gazebo Sim entity IDs and monitor map<->Gazebo spatial divergence."""
-        now = time.time()
+        """Cache Gazebo Sim entity IDs to prevent lookup errors and eliminate console spam."""
         for p in msg.pose:
-            for rid, robot in self.robots.items():
+            for rid in self.robots:
                 if p.name in (f'{rid}/turtlebot4', rid):
                     if p.id != 0 and self.gz_entity_ids.get(rid) != p.id:
                         self.gz_entity_ids[rid] = p.id
                         self.get_logger().info(f'Resolved Gazebo entity ID for {rid} ({p.name}) -> {p.id}')
-
-                    robot.gz_observed_x = float(p.position.x)
-                    robot.gz_observed_y = float(p.position.y)
-                    _, _, yaw = quaternion_to_euler(p.orientation)
-                    robot.gz_observed_yaw = float(yaw)
-                    robot.last_gz_observed_time = now
-
-                    err_dist = math.hypot(robot.true_x - robot.gz_observed_x, robot.true_y - robot.gz_observed_y)
-                    if err_dist > 0.25:
-                        if not robot.divergence_hold:
-                            robot.divergence_hold = True
-                            self.get_logger().warning(
-                                f'[Carrier] AMR {rid} held due to real divergence: '
-                                f'error={err_dist:.3f}m > 0.25m (true=({robot.true_x:.3f}, {robot.true_y:.3f}), '
-                                f'gz=({robot.gz_observed_x:.3f}, {robot.gz_observed_y:.3f}))',
-                                throttle_duration_sec=2.0
-                            )
-                        robot.consecutive_healthy_observations = 0
-                    elif err_dist <= 0.05:
-                        robot.consecutive_healthy_observations += 1
-                        if robot.divergence_hold and robot.consecutive_healthy_observations >= 5:
-                            robot.divergence_hold = False
-                            self.get_logger().info(
-                                f'[Carrier] AMR {rid} divergence resolved (consecutive healthy observations >= 5). '
-                                f'Resuming normal motion.'
-                            )
 
     def _is_position_collision_free(self, robot_id: str, x: float, y: float, curr_x: Optional[float] = None, curr_y: Optional[float] = None) -> bool:
         """Check if a circular footprint at (x, y) intersects shelves, walls, or other AMRs.
@@ -384,31 +333,15 @@ class KinematicCarrierNode(Node):
         return True
 
     def _simulation_step(self):
-        """Execute one simulation tick: update AMR positions, collisions, odometry, and queue Gazebo pose update."""
-        now_s = now_seconds(self)
-        now_wall = time.time()
+        """Execute one 50 Hz kinematic motion integration and update cycle."""
         dt = 1.0 / max(1.0, self.update_rate_hz)
-        
+        now_s = now_seconds(self)
+
         gz_pose_vector = GzPose_V() if (GZ_TRANSPORT_AVAILABLE and self.gz_node) else None
 
         for robot_id, robot in self.robots.items():
-            # Check stale Gazebo pose feedback while in motion (wall time)
-            if robot.last_gz_observed_time > 0 and (now_wall - robot.last_gz_observed_time) > 2.0:
-                if abs(robot.cmd_linear_x) > 0.01 or abs(robot.cmd_angular_z) > 0.01:
-                    if not robot.divergence_hold:
-                        robot.divergence_hold = True
-                        self.get_logger().warning(
-                            f'[Carrier] AMR {robot_id} held due to stale Gazebo pose stream '
-                            f'({now_wall - robot.last_gz_observed_time:.2f}s > 2.0s)',
-                            throttle_duration_sec=2.0
-                        )
-
-            # Evaluate commanded velocity
-            if robot.divergence_hold:
-                v = 0.0
-                w = 0.0
-            elif now_s - robot.last_cmd_time > 0.5:
-                # Timeout commanded velocity
+            # Command timeout: if no cmd_vel received within 0.5s, decelerate to 0
+            if now_s - robot.last_cmd_time > 0.5:
                 v = 0.0
                 w = 0.0
             else:
@@ -492,27 +425,13 @@ class KinematicCarrierNode(Node):
             self._publish_odometry(robot, dt, v, w)
             self._check_anchor_proximity(robot)
 
-        # Buffer latest absolute poses for decoupled Gazebo dispatch
-        if gz_pose_vector is not None and len(gz_pose_vector.pose) > 0:
-            self.latest_gz_pose_vector = gz_pose_vector
+        # Dispatch batch pose update to Gazebo via non-blocking background worker
+        if gz_pose_vector is not None and len(gz_pose_vector.pose) > 0 and self.gz_executor is not None:
+            if self.gz_future is None or self.gz_future.done():
+                self.gz_future = self.gz_executor.submit(self._dispatch_gz_pose, gz_pose_vector)
 
         # Publish true pose telemetry for validation
         self._publish_telemetry_true_poses()
-
-    def _gz_dispatch_step(self):
-        """Decoupled Gazebo batch pose dispatch running at 20 Hz with latest-only coalescing."""
-        if not GZ_TRANSPORT_AVAILABLE or self.gz_node is None or self.gz_executor is None:
-            return
-        if self.latest_gz_pose_vector is None or len(self.latest_gz_pose_vector.pose) == 0:
-            return
-
-        if self.gz_future is not None and not self.gz_future.done():
-            self.gz_coalesced_count += 1
-            return
-
-        batch = self.latest_gz_pose_vector
-        self.latest_gz_pose_vector = None
-        self.gz_future = self.gz_executor.submit(self._dispatch_gz_pose, batch)
 
     def _dispatch_gz_pose(self, gz_pose_vector):
         """Execute Gazebo set_pose_vector request in background worker to prevent choking the motion timer."""
@@ -524,41 +443,27 @@ class KinematicCarrierNode(Node):
                 gz_pose_vector,
                 GzPose_V,
                 GzBoolean,
-                timeout=int(self.gz_request_timeout_ms)
+                timeout=10
             )
-            lat_ms = (time.perf_counter() - t0) * 1000.0
-            self.last_gz_latency_ms = lat_ms
-            if lat_ms > self.max_gz_latency_ms:
-                self.max_gz_latency_ms = lat_ms
-
-            if res and rep is not None and rep.data:
-                self.gz_sync_success_count += 1
-            elif res and rep is not None and not rep.data:
-                self.gz_sync_rejected_count += 1
+            if not (res and rep is not None and rep.data):
                 self.gz_sync_error_count += 1
+                err_kind = 'rejected' if (res and rep is not None and not rep.data) else 'timeout/unreachable'
                 self.get_logger().warning(
-                    f'[Carrier] Gazebo set_pose_vector rejected by server. '
-                    f'Rejections: {self.gz_sync_rejected_count}, Total errors: {self.gz_sync_error_count}/{self.gz_sync_total_count}.',
-                    throttle_duration_sec=5.0
-                )
-            else:
-                self.gz_sync_timeout_count += 1
-                self.gz_sync_error_count += 1
-                self.get_logger().warning(
-                    f'[Carrier] Gazebo set_pose_vector deadline miss / timeout ({lat_ms:.1f}ms > {self.gz_request_timeout_ms}ms). '
-                    f'Timeouts: {self.gz_sync_timeout_count}, Total errors: {self.gz_sync_error_count}/{self.gz_sync_total_count}.',
+                    f'[Carrier] Gazebo set_pose_vector failed ({err_kind}). '
+                    f'Sync failures: {self.gz_sync_error_count}/{self.gz_sync_total_count}.',
                     throttle_duration_sec=5.0
                 )
         except Exception as e:
-            lat_ms = (time.perf_counter() - t0) * 1000.0
-            self.last_gz_latency_ms = lat_ms
-            self.gz_sync_exception_count += 1
             self.gz_sync_error_count += 1
             self.get_logger().warning(
                 f'[Carrier] Exception in Gazebo set_pose_vector: {e}. '
-                f'Exceptions: {self.gz_sync_exception_count}, Total errors: {self.gz_sync_error_count}/{self.gz_sync_total_count}.',
+                f'Sync failures: {self.gz_sync_error_count}/{self.gz_sync_total_count}.',
                 throttle_duration_sec=5.0
             )
+        lat_ms = (time.perf_counter() - t0) * 1000.0
+        self.last_gz_latency_ms = lat_ms
+        if lat_ms > self.max_gz_latency_ms:
+            self.max_gz_latency_ms = lat_ms
 
     def _publish_odometry(self, robot: RobotKinematicState, dt: float, cmd_v: float, cmd_w: float):
         """Publish standard nav_msgs/Odometry for localization_node."""
