@@ -4,7 +4,7 @@
 Runs sequential work-cycle benchmarks on Desktop (Ryzen 5 5600X + RTX 3070):
 - 4 TurtleBot 4 AMRs (standard non-congested fleet size)
 - Standard 0.46 m/s physical_max velocity profile
-- Unthrottled Gazebo physics (50 Hz, 3.1x RTF)
+- Unthrottled Gazebo physics by default; use -rtf to apply an opt-in wall-clock cap
 - Consolidated robot agent processes (low CPU footprint)
 - DDS Domain IDs cycling in [10, 49]
 - Disjoint random seeds in [1000, 1059]
@@ -39,6 +39,7 @@ C_CYAN = "\033[36m"
 C_WHITE = "\033[37m"
 C_BG_BLUE = "\033[44m"
 C_BG_DARK = "\033[100m"
+PHYSICS_MAX_STEP_SIZE_S = 0.02
 
 
 def collection_log_root() -> Path:
@@ -116,7 +117,9 @@ class DesktopCycleRun:
         base_dir: Path,
         timeout_s: int,
         fleet_count: int = 4,
-        gui: bool = False
+        gui: bool = False,
+        world_file: Optional[Path] = None,
+        target_rtf: Optional[float] = None,
     ):
         self.run_index = run_index
         self.total_runs = total_runs
@@ -125,6 +128,8 @@ class DesktopCycleRun:
         self.timeout_s = timeout_s
         self.fleet_count = fleet_count
         self.gui = gui
+        self.world_file = world_file
+        self.target_rtf = target_rtf
         self.run_id = f"desktop_run_{run_index:03d}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.log_dir = base_dir / self.run_id
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -352,6 +357,10 @@ class DesktopCycleRun:
         self.start_time = time.time()
         
         env = os.environ.copy()
+        # A run without -rtf must retain the historic unthrottled behavior,
+        # even if a parent shell happened to export one of these variables.
+        env.pop("SIM_RTF_LIMIT", None)
+        env.pop("GZ_SIM_UPDATE_RATE_HZ", None)
         env["START_GUI"] = "true" if self.gui else "false"
         env["START_FLEET"] = "true"
         env["FLEET_RANDOM_TASKS"] = "true"
@@ -368,6 +377,11 @@ class DesktopCycleRun:
         env["FLEET_ENABLE_FAULTS"] = "false"
         env["FLEET_ENABLE_SPAWNER"] = "true"
         env["FLEET_ENABLE_VISION"] = "false"
+        if self.world_file is not None:
+            env["WORLD_FILE"] = str(self.world_file)
+        if self.target_rtf is not None:
+            env["SIM_RTF_LIMIT"] = f"{self.target_rtf:g}"
+            env["GZ_SIM_UPDATE_RATE_HZ"] = f"{self.target_rtf / PHYSICS_MAX_STEP_SIZE_S:g}"
         env["__NV_PRIME_RENDER_OFFLOAD"] = "1"
         env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
         env["CUDA_VISIBLE_DEVICES"] = "0"
@@ -386,6 +400,10 @@ class DesktopCycleRun:
         print(f"\n{C_BG_BLUE}{C_WHITE}{C_BOLD} >>> STARTING DESKTOP TEST RUN {self.run_index}/{self.total_runs}: {self.run_id} <<<{C_RESET}")
         print(f" {C_CYAN}Target Work Cycle:{C_RESET} {self.target_tasks} completed tasks across {self.fleet_count} AMRs")
         print(f" {C_CYAN}Tracking Speed:{C_RESET}    {tracking_speed} m/s (Standard Physical Max)")
+        if self.world_file is not None:
+            print(f" {C_CYAN}World File:{C_RESET}        {self.world_file}")
+        if self.target_rtf is not None:
+            print(f" {C_CYAN}Requested RTF Cap:{C_RESET} {self.target_rtf:g}x ({self.target_rtf / PHYSICS_MAX_STEP_SIZE_S:g} Hz server update rate)")
         print(f" {C_CYAN}Log Directory:{C_RESET}     {self.log_dir}")
         print(f" {C_CYAN}DDS Domain ID:{C_RESET}     {run_domain_id} (Range [10, 49]) | Seed: {seed + self.run_index}")
         print(f" {C_CYAN}Fleet Architecture:{C_RESET}Consolidated Agent Processes, 50 Hz Physics, Lean Telemetry\n")
@@ -512,10 +530,20 @@ def main():
     parser.add_argument("--seed", type=int, default=1000, help="Base random seed for Desktop")
     parser.add_argument("--timeout", type=int, default=3600, help="Per-run timeout seconds")
     parser.add_argument("--gui", action="store_true", default=False, help="Launch Gazebo with GUI enabled (default: headless)")
+    parser.add_argument("-w", "--world", metavar="PATH", help="Gazebo world file to use instead of the default warehouse world")
+    parser.add_argument("-rtf", "--rtf", type=float, metavar="FACTOR", help="Optional positive Gazebo real-time-factor cap; omitted keeps the historic unthrottled behavior")
     repo_root = Path(__file__).resolve().parent.parent
     parser.add_argument("-d", "--compile-dataset", action="store_true", help="Rebuild the complete desktop dataset from all saved desktop telemetry after the run")
     parser.add_argument("-o", "--output-csv", default=str(repo_root / "collected_datasets_desktop.csv"), help="Dataset output path used with -d")
     args = parser.parse_args()
+
+    world_file = None
+    if args.world:
+        world_file = Path(args.world).expanduser().resolve()
+        if not world_file.is_file():
+            parser.error(f"world file not found: {world_file}")
+    if args.rtf is not None and args.rtf <= 0:
+        parser.error("-rtf/--rtf must be greater than zero")
 
     log_root = collection_log_root()
     base_dir = log_root / f"desktop_data_collection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -533,7 +561,8 @@ def main():
         for idx in range(1, args.runs + 1):
             run = DesktopCycleRun(
                 idx, args.runs, args.tasks, base_dir, args.timeout,
-                fleet_count=args.fleet_size, gui=args.gui
+                fleet_count=args.fleet_size, gui=args.gui, world_file=world_file,
+                target_rtf=args.rtf
             )
             success = run.execute(tracking_speed=args.speed, settle_s=3, seed=args.seed)
             if run.telemetry_file.exists() and run.telemetry_file.stat().st_size > 0:

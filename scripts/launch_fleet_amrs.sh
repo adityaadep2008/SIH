@@ -17,6 +17,8 @@ SIMULATION_BACKEND="${SIMULATION_BACKEND:-kinematic_lidar_carrier}"
 FLEET_COUNT="${FLEET_COUNT:-6}"
 SENSOR_PROFILE="${SENSOR_PROFILE:-fleet}"
 LIDAR_UPDATE_RATE_HZ="${LIDAR_UPDATE_RATE_HZ:-5.0}"
+SIM_RTF_LIMIT="${SIM_RTF_LIMIT:-}"
+GZ_SIM_UPDATE_RATE_HZ="${GZ_SIM_UPDATE_RATE_HZ:-}"
 RENDER_ENGINE="${RENDER_ENGINE:-ogre2}"
 GUI_RENDER_ENGINE="${GUI_RENDER_ENGINE:-ogre2}"
 GUI_CONFIG="${GZ_GUI_CONFIG:-/opt/ros/jazzy/opt/gz_sim_vendor/share/gz/gz-sim8/gui/gui.config}"
@@ -56,7 +58,7 @@ write_run_event() {
   printf '{"event_type":"%s","wall_epoch_s":%s,"detail":"%s"}\n' "$1" "$(date +%s)" "$2" >> "$RUN_EVENTS_FILE"
 }
 write_run_event launcher_started "fleet_count=$FLEET_COUNT headless_or_gui_run_requested"
-write_run_event simulation_profile "sensor_profile=$SENSOR_PROFILE lidar_hz=$LIDAR_UPDATE_RATE_HZ tracking_mps=$FLEET_TRACKING_SPEED_MPS"
+write_run_event simulation_profile "sensor_profile=$SENSOR_PROFILE lidar_hz=$LIDAR_UPDATE_RATE_HZ tracking_mps=$FLEET_TRACKING_SPEED_MPS target_rtf=${SIM_RTF_LIMIT:-unthrottled}"
 
 source /opt/ros/jazzy/setup.bash
 [[ -f "$OVERLAY/setup.bash" ]] && source "$OVERLAY/setup.bash"
@@ -159,8 +161,15 @@ echo "Validating physics timing invariant (controller_update_rate <= 1 / max_ste
 python3 -m sih_amr_fleet.physics_validator --world "$WORLD_FILE" --control-config "$CONTROL_CONFIG" || fail 'Physics and controller timing invariant failed'
 
 echo "Run logs: $LOG_DIR"
-echo "Starting unthrottled Gazebo server with $RENDER_ENGINE..."
-start_group "$LOG_DIR/gazebo_server.log" gz sim -s -r --render-engine "$RENDER_ENGINE" "$WORLD_FILE"
+GZ_SERVER_ARGS=(gz sim -s -r --render-engine "$RENDER_ENGINE")
+if [[ -n "$GZ_SIM_UPDATE_RATE_HZ" ]]; then
+  [[ "$GZ_SIM_UPDATE_RATE_HZ" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'GZ_SIM_UPDATE_RATE_HZ must be a positive numeric value.'
+  echo "Starting Gazebo server with $RENDER_ENGINE at ${GZ_SIM_UPDATE_RATE_HZ} Hz wall-clock update rate (target RTF: ${SIM_RTF_LIMIT:-unspecified})..."
+  GZ_SERVER_ARGS+=(-z "$GZ_SIM_UPDATE_RATE_HZ")
+else
+  echo "Starting unthrottled Gazebo server with $RENDER_ENGINE..."
+fi
+start_group "$LOG_DIR/gazebo_server.log" "${GZ_SERVER_ARGS[@]}" "$WORLD_FILE"
 SERVER_PID="$STARTED_PID"
 write_run_event gazebo_server_started "pid=$SERVER_PID"
 wait_for server 60 kill -0 "$SERVER_PID" || fail 'Gazebo server exited during startup'
