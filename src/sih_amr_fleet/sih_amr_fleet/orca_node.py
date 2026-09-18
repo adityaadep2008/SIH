@@ -50,9 +50,7 @@ class OrcaNode(Node):
             ]
             vx, vy = avoidance_velocity(preferred, (self.pose.x, self.pose.y), peers, self.radius, 1.5, self.max_speed, self_id=self.robot_id)
             raw_linear_x = vx * direction[0] + vy * direction[1]
-            if self.desired.linear.x < -0.01:
-                result.linear.x = self.desired.linear.x
-            elif self.desired.linear.x <= 0.01:
+            if self.desired.linear.x <= 0.01:
                 result.linear.x = 0.0
             else:
                 result.linear.x = max(0.0, min(raw_linear_x, self.desired.linear.x))

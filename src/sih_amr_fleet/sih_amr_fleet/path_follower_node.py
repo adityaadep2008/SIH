@@ -35,8 +35,6 @@ class PathFollowerNode(Node):
         self.recovery_start_pose = None
         self.recovery_cooldown_until = 0.0
         self.safety_stop_started = None
-        self.last_progress_pose = None
-        self.last_progress_time = 0.0
         self.session_id, self.sequence = new_session_id(), 0
         self._received_local_state = False
         self.pub = self.create_publisher(Twist, 'cmd_vel_desired', FLEET_STATE_QOS)
@@ -189,22 +187,6 @@ class PathFollowerNode(Node):
                 cmd = self.steer_to(target, speed_limit)
                 dx, dy = target.x - self.pose.x, target.y - self.pose.y
                 ang_err = math.atan2(math.sin(math.atan2(dy, dx) - self.pose.theta), math.cos(math.atan2(dy, dx) - self.pose.theta))
-                if cmd.linear.x > 0.05:
-                    if self.last_progress_pose is None:
-                        self.last_progress_pose = (self.pose.x, self.pose.y)
-                        self.last_progress_time = now
-                    else:
-                        d_prog = math.hypot(self.pose.x - self.last_progress_pose[0], self.pose.y - self.last_progress_pose[1])
-                        if d_prog > 0.15:
-                            self.last_progress_pose = (self.pose.x, self.pose.y)
-                            self.last_progress_time = now
-                        elif now - self.last_progress_time > 6.0:
-                            if self.recovery_state == 'IDLE' and now >= self.recovery_cooldown_until:
-                                self.recovery_state, self.recovery_started = 'VERIFY', now
-                                self.publish_event('recovery_stop', 'persistent motion stall / peer block')
-                                self.last_progress_time = now
-                else:
-                    self.last_progress_pose = None
                 self.get_logger().info(
                     f'[{self.robot_id}:PathFollower] Decision: TRACK_WAYPOINT. Actor=PathFollower:{self.robot_id}. '
                     f'Info: pose=({self.pose.x:.2f}, {self.pose.y:.2f}), target=({target.x:.2f}, {target.y:.2f}), '

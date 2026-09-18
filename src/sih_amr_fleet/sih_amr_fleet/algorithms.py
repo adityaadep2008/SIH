@@ -306,21 +306,6 @@ def whca_star(start, goal, blocked, reservations, width, height, horizon,
             return 1
         return 0
 
-    def directional_corridor_penalty(x, dy):
-        # In open warehouse corridors (width >= 60), bias opposing traffic into right-hand lanes
-        if width >= 60:
-            if dy > 0:  # Traveling North (+y)
-                if 27 <= x <= 35 and x < 33:
-                    return 2.5
-                if 55 <= x <= 63 and x < 60:
-                    return 2.5
-            elif dy < 0:  # Traveling South (-y)
-                if 27 <= x <= 35 and x > 31:
-                    return 2.5
-                if 55 <= x <= 63 and x > 58:
-                    return 2.5
-        return 0.0
-
     # Manhattan distance is not a usable rolling-horizon heuristic in this
     # warehouse.  At the end of a shelf row, reaching the next aisle requires
     # temporarily increasing Manhattan distance.  With WAIT as an available
@@ -335,12 +320,14 @@ def whca_star(start, goal, blocked, reservations, width, height, horizon,
         distance, x, y = heapq.heappop(distance_queue)
         if distance != distance_to_goal.get((x, y)):
             continue
+        # In reverse, a predecessor enters the current cell during forward
+        # travel, so the current cell's proximity cost belongs on this edge.
+        next_distance = distance + 1 + proximity_penalty(x, y)
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             cell = (x + dx, y + dy)
             if (cell in blocked or
                     not (0 <= cell[0] < width and 0 <= cell[1] < height)):
                 continue
-            next_distance = distance + 1 + proximity_penalty(x, y) + directional_corridor_penalty(x, -dy)
             if next_distance < distance_to_goal.get(cell, math.inf):
                 distance_to_goal[cell] = next_distance
                 heapq.heappush(distance_queue, (next_distance, cell[0], cell[1]))
@@ -386,7 +373,7 @@ def whca_star(start, goal, blocked, reservations, width, height, horizon,
                     pdx, pdy = x - pstate[0], y - pstate[1]
                     if (pdx, pdy) != (0, 0) and (dx, dy) != (pdx, pdy):
                         turn_penalty = 0.35
-            new_g = g + 1 + proximity_penalty(nx, ny) + directional_corridor_penalty(nx, dy) + turn_penalty
+            new_g = g + 1 + proximity_penalty(nx, ny) + turn_penalty
             if new_g < cost.get(candidate, math.inf):
                 cost[candidate] = new_g
                 parent[candidate] = state
