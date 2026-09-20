@@ -280,7 +280,9 @@ def test_avoidance_2d_cpa_parallel_clearance():
 
 
 def test_avoidance_deterministic_priority_head_on():
-    winner_safe = avoidance_velocity(
+    # In balanced reciprocal ORCA (per Rule 4 of AGENTS.md), opposing moving peers
+    # both reciprocally decelerate to avoid collision without asymmetric ID overrides.
+    robot1_safe = avoidance_velocity(
         preferred=(0.46, 0.0),
         self_xy=(0.0, 0.0),
         peers=[{
@@ -294,9 +296,10 @@ def test_avoidance_deterministic_priority_head_on():
         max_speed=0.46,
         self_id='robot_1'
     )
-    assert abs(winner_safe[0] - 0.46) < 0.01
+    # Reciprocally decelerated below preferred speed
+    assert robot1_safe[0] < 0.46
 
-    loser_safe = avoidance_velocity(
+    robot3_safe = avoidance_velocity(
         preferred=(-0.46, 0.0),
         self_xy=(1.5, 0.0),
         peers=[{
@@ -310,7 +313,9 @@ def test_avoidance_deterministic_priority_head_on():
         max_speed=0.46,
         self_id='robot_3'
     )
-    assert loser_safe[0] > -0.46
+    # Reciprocally decelerated symmetrically
+    assert robot3_safe[0] > -0.46
+    assert abs(abs(robot1_safe[0]) - abs(robot3_safe[0])) < 1e-4
 
 
 def test_orca_node_clamping_and_priority_halt():
@@ -1148,5 +1153,56 @@ def test_corridor_approach_cells_only_at_longitudinal_caps():
             assert ay == cy, f"Approach cell ({ax}, {ay}) spilled into adjacent y levels (expected cy={cy})"
     finally:
         node.destroy_node()
+
+
+def test_avoidance_stationary_peer_stop():
+    """Verify that a moving AMR yields 100% and brakes before a stationary peer."""
+    preferred = (0.0, -0.46)
+    self_xy = (-6.0, -9.0)
+    stationary_peer = {
+        'x': -6.0, 'y': -10.0,
+        'vx': 0.0, 'vy': 0.0,
+        'radius_inflation': 0.0,
+        'id': 'robot_4'
+    }
+    vx, vy = avoidance_velocity(preferred, self_xy, [stationary_peer], radius=0.35, horizon=1.5, max_speed=0.46, self_id='robot_3')
+    # Forward velocity must be heavily braked (< 0.40 m/s magnitude) regardless of robot ID comparison
+    assert abs(vy) < 0.40, f"Expected braking for stationary peer, got vy={vy:.3f}"
+
+
+def test_avoidance_reciprocal_moving_peers():
+    """Verify that two moving peers on a collision course reciprocally decelerate."""
+    # Robot 3 moving south at 0.46 m/s
+    r3_xy = (-6.0, -9.0)
+    r3_preferred = (0.0, -0.46)
+
+    # Robot 4 moving north at 0.46 m/s
+    r4_peer = {
+        'x': -6.0, 'y': -11.0,
+        'vx': 0.0, 'vy': 0.46,
+        'radius_inflation': 0.0,
+        'id': 'robot_4'
+    }
+
+    v3_x, v3_y = avoidance_velocity(r3_preferred, r3_xy, [r4_peer], radius=0.35, horizon=1.5, max_speed=0.46, self_id='robot_3')
+
+    # Reverse perspective: Robot 4 observing Robot 3
+    r4_xy = (-6.0, -11.0)
+    r4_preferred = (0.0, 0.46)
+    r3_peer = {
+        'x': -6.0, 'y': -9.0,
+        'vx': 0.0, 'vy': -0.46,
+        'radius_inflation': 0.0,
+        'id': 'robot_3'
+    }
+
+    v4_x, v4_y = avoidance_velocity(r4_preferred, r4_xy, [r3_peer], radius=0.35, horizon=1.5, max_speed=0.46, self_id='robot_4')
+
+    # Both robots must reciprocally brake (|vy| < 0.46 m/s) with balanced magnitudes
+    assert abs(v3_y) < 0.46, f"Robot 3 should brake, got {v3_y}"
+    assert abs(v4_y) < 0.46, f"Robot 4 should brake, got {v4_y}"
+    assert abs(abs(v3_y) - abs(v4_y)) < 1e-4, f"Reciprocal braking must be symmetric: v3_y={v3_y}, v4_y={v4_y}"
+
+
 
 

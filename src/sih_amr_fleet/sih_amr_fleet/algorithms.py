@@ -474,8 +474,10 @@ def avoidance_velocity(preferred, self_xy, peers, radius, horizon, max_speed, se
             vx, vy = 0.0, 0.0
             continue
 
-        v_rel_x = peer['vx'] - vx
-        v_rel_y = peer['vy'] - vy
+        peer_vx = peer.get('vx', 0.0)
+        peer_vy = peer.get('vy', 0.0)
+        v_rel_x = peer_vx - vx
+        v_rel_y = peer_vy - vy
         v_rel_sq = v_rel_x * v_rel_x + v_rel_y * v_rel_y
 
         closing = - (dx * v_rel_x + dy * v_rel_y)
@@ -495,9 +497,10 @@ def avoidance_velocity(preferred, self_xy, peers, radius, horizon, max_speed, se
         if d_min < 2.0 * effective_radius:
             overlap = 2.0 * effective_radius - d_min
             push = overlap / max(t_star, 0.2)
-            peer_id = peer.get('id') or peer.get('robot_id')
-            if self_id is not None and peer_id:
-                yield_factor = 0.0 if str(self_id) < str(peer_id) else 1.0
+            peer_speed = math.hypot(peer_vx, peer_vy)
+            if peer_speed < 0.05:
+                # A stationary peer cannot yield; the moving AMR takes full responsibility
+                yield_factor = 1.0
             else:
                 yield_factor = 0.5
 

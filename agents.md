@@ -1,4 +1,86 @@
-# SIH Decentralized Multi-AMR Fleet Simulation & Agent Guide
+# Mandatory AI Agent Operational Governance Rules & Fleet Guide
+
+> **CRITICAL REPOSITORY PROTECTION POLICY**:
+> This file establishes strict, immutable boundaries for all AI coding assistants (including Antigravity, Gemini, and any subagents) operating on this repository. Every agent must strictly adhere to these rules without exception.
+
+---
+
+## 1. Absolute Prohibition: No Agent-Driven Final Script Execution
+
+### Rule
+**NO AI AGENT SHALL EVER RUN FINAL DATA COLLECTION, FLEET BENCHMARKING, OR LONG-RUNNING SIMULATION SCRIPTS.**
+
+This includes, but is not limited to:
+- `scripts/run_desktop_data_collection.py`
+- `scripts/run_laptop_data_collection.py`
+- `scripts/run_multi_work_cycles.py`
+- `scripts/run_speed_and_fleet_optimization.py`
+- `scripts/launch_fleet_amrs.sh`
+- `scripts/launch_four_amrs.sh`
+- `scripts/launch_four_lite.sh`
+- `scripts/launch_four_standard.sh`
+- `scripts/warehouse.sh`
+- Any command that launches Gazebo simulation, spawns multi-robot fleets, or runs live work cycles.
+
+**Execution of these scripts is reserved EXCLUSIVELY for human operators.**
+
+### What Agents CAN Run:
+- Clean build commands (e.g. `colcon build --packages-select <pkg>`)
+- Discrete unit tests (e.g. `pytest src/...`, `colcon test`)
+- Read-only diagnostics (inspecting logs, reviewing telemetry datasets, checking git status/diffs, verifying process tables with `ps`/`pgrep`)
+- Read-only static analysis and syntax checks
+
+---
+
+## 2. Mandatory Forensic Diagnosis Before Any Proposed Changes
+
+### Rule
+**NO CODE CHANGES SHALL BE MADE WITHOUT FORENSIC INVESTIGATION AND IRREFUTABLE PROOF.**
+
+Before touching any code:
+1. **Analyze Past Runs & Logs**: Agents must thoroughly examine past run artifacts, telemetry logs (`fleet_telemetry.jsonl`), run events (`run_events.jsonl`), carrier logs, Gazebo server logs, and system metrics.
+2. **Diagnose Beyond a Doubt**: Agents must identify the root cause with empirical evidence (timestamps, coordinates, error messages, process IDs, mathematical calculations).
+3. **Present a Solid Forensic Case**: Agents must clearly present their diagnosis and proof to the human operator before formulating a fix.
+
+---
+
+## 3. Strict Human Verification Gate (Plan-Only First)
+
+### Rule
+**AGENTS MUST ONLY PRESENT A PLAN TO THE HUMAN. NO CODE MODIFICATION MAY OCCUR WITHOUT EXPLICIT HUMAN APPROVAL.**
+
+1. Once the forensic diagnosis is verified, agents must prepare and present a detailed implementation plan.
+2. The implementation plan must detail the exact files, mathematical rationale, parameter values, and unit verification steps.
+3. **STOP AND WAIT**: The agent MUST NOT modify code, create commits, or execute alterations until the human explicitly reviews and verifies the plan with an affirmative instruction to proceed.
+
+---
+
+## 4. Absolute Prohibition: No Tampering With Proven Core Baseline Algorithms
+
+### Rule
+**NO AI AGENT SHALL EVER ALTER, HACK, OVERRIDE, OR DEPRECATE PROVEN CORE BASELINE COORDINATION ARCHITECTURE.**
+
+The verified baseline algorithms that achieved 20/20 flawless task completion (WHCA* 4D space-time reservations, reciprocal ORCA velocity obstacles, CBBA decentralized auction consensus, and Corridor Mutex single-aisle locking) are immutable foundational assets.
+
+**Specifically, AI AGENTS ARE STRICTLY FORBIDDEN FROM:**
+1. **Ad-Hoc Corridor Penalties**: Adding artificial corridor lane penalties, directional costs, or heuristic distortions into backward Dijkstra or forward A* search (`whca_star`). WHCA* 4D space-time coordination must resolve corridor traffic without artificial single-lane funnels.
+2. **Asymmetric Yielding & Velocity Clamping**: Introducing asymmetric robot-ID priority yields, hard overrides, or artificial zero-velocity clamps into reciprocal velocity obstacles (`avoidance_velocity` / `orca_node.py`). Reciprocal velocity-obstacle mathematics must remain balanced and uncorrupted.
+3. **Static All-Horizon Peer Blockages**: Injecting synthetic permanent obstacles across future horizon time steps in `whca_planner_node.py`. Space-time dynamic reservations must coordinate trailing and moving AMRs naturally.
+4. **Architectural Hacking**: Rewriting or replacing established coordination components (`CBBA`, `TaskExecutor`, `CorridorMutex`, `SafetySupervisor`) based on loose interpretations or speculative 'enhancements'.
+5. **Regression Verification Requirement**: Any approved bug fix MUST be accompanied by a regression unit test demonstrating that baseline throughput and zero-collision guarantees are preserved.
+
+---
+
+## Summary Directive for AI Agents
+- **Do not run simulation/benchmark scripts.**
+- **Diagnose with concrete evidence first.**
+- **Present a plan and wait for human sign-off.**
+- **Never tamper with core baseline coordination algorithms.**
+- **Build and unit-test only after approval.**
+
+---
+
+# Technical Architecture & Reference Guide
 
 ## System & Environment Specifications
 
@@ -106,8 +188,8 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
-### 2. Launching 4-AMR Fleet Simulation
-Run the complete multi-robot stack:
+### 2. Launching 4-AMR Fleet Simulation (HUMAN OPERATOR EXCLUSIVE)
+*(AI Agents: DO NOT execute these commands. See Rule 1.)*
 ```bash
 # Terminal 1: Full simulation with GUI
 amr4
@@ -116,7 +198,8 @@ amr4
 amr4_headless
 ```
 
-### 3. Running Data Collection & Optimization Scripts
+### 3. Running Data Collection & Optimization Scripts (HUMAN OPERATOR EXCLUSIVE)
+*(AI Agents: DO NOT execute these commands. See Rule 1.)*
 ```bash
 cd ~/amr_ws/src/SIH
 
