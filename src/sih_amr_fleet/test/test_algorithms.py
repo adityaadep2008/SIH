@@ -1204,5 +1204,72 @@ def test_avoidance_reciprocal_moving_peers():
     assert abs(abs(v3_y) - abs(v4_y)) < 1e-4, f"Reciprocal braking must be symmetric: v3_y={v3_y}, v4_y={v4_y}"
 
 
+def test_outer_west_wall_column_is_blocked():
+    """Verify that outer perimeter column cx=0 is blocked across all height rows."""
+    raw_data = {
+        'grid': {'resolution': 0.5, 'width': 90, 'height': 120, 'origin_x': -22.5, 'origin_y': -30.0},
+        'shelves': [],
+        'charging_pads': [],
+    }
+    resolution, width, height, origin_x, origin_y, blocked = map_geometry_from_data(raw_data)
+    for cy in range(height):
+        assert (0, cy) in blocked, f"Boundary cell (0, {cy}) must be blocked to prevent wall gap entry"
+
+
+def test_western_shelf_path_exits_east_never_west_wall():
+    """Verify that a path from a western shelf exits east towards main corridor and never visits cx=0."""
+    with open('warehouse_layout.lock.yaml', 'r') as f:
+        layout = yaml.safe_load(f)
+    resolution, width, height, origin_x, origin_y, blocked = map_geometry_from_data(layout)
+    # Start at western shelf aisle cell (1, 25), goal at main corridor cell (30, 25)
+    start = (1, 25)
+    goal = (30, 25)
+    path = whca_star(
+        start=start,
+        goal=goal,
+        blocked=blocked,
+        reservations=set(),
+        width=width,
+        height=height,
+        horizon=100
+    )
+    assert path, "Path from western shelf must be reachable"
+    for cx, cy, _ in path:
+        assert cx > 0, f"Path visited outer west wall cell ({cx}, {cy})"
+    # Path must progress eastward (cx increasing) towards the main corridor (cx=30)
+    assert path[-1][0] == 30
+
+
+def test_safety_supervisor_node_enforce():
+    """Verify that SafetySupervisorNode.enforce() executes cleanly without NameError."""
+    import rclpy
+    from sih_amr_fleet.safety_supervisor_node import SafetySupervisorNode
+
+    if not rclpy.ok():
+        rclpy.init()
+    node = SafetySupervisorNode()
+    try:
+        # Candidate stopped
+        node.candidate.linear.x = 0.0
+        node.candidate.angular.z = 0.0
+        node.enforce()
+
+        # Candidate moving forward at tracking speed
+        node.candidate.linear.x = 0.46
+        node.candidate.angular.z = 0.1
+        node.pose_time = node.get_clock().now().nanoseconds / 1e9
+        node.scan_time = node.get_clock().now().nanoseconds / 1e9
+        node.enforce()
+
+        # Candidate moving backward
+        node.candidate.linear.x = -0.2
+        node.candidate.angular.z = 0.0
+        node.enforce()
+    finally:
+        node.destroy_node()
+
+
+
+
 
 

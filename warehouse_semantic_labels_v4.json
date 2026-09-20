@@ -5,6 +5,7 @@
   "shelves_count": 192,
   "corridors_count": 172,
   "junctions_count": 6,
+  "blocked_perimeter_columns": [0],
   "shelves": [
     {
       "shelf_id": "shelf_south_west_R01_C01",

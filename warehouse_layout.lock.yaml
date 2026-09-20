@@ -19,6 +19,7 @@ coordinate_system:
   simulation_source: gazebo_odometry_transformed_to_map
   physical_source: dock_anchor_reset_plus_wheel_odom_imu_and_local_perception
   gazebo_pose_policy: "simulation-only ground truth; never a physical-AMR localization dependency"
+  wall_boundary_policy: "grid column cx=0 represents the inner surface of the west concrete wall (x=-22.5m) and is blocked across all rows to prevent traversal through the impassable 0.55m gap behind western shelves"
   restart_policy: "publish localization invalid; move slowly along the most open safe direction; use green main-corridor tape to return to a charging-pad anchor; reset map pose only after dock confirmation"
 warehouse:
   id: WH-01

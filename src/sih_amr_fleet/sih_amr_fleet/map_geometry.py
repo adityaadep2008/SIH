@@ -41,4 +41,11 @@ def map_geometry_from_data(
                                 if 0 <= cell[0] < width and 0 <= cell[1] < height:
                                     blocked.add(cell)
 
+    # Outer perimeter west wall: the physical concrete wall inner surface is at
+    # origin_x (x = -22.5m, cell cx = 0). Blocking column cx = 0 prevents AMRs
+    # from treating the impassable 0.55m gap between the shelves and the outer wall
+    # as a traversable shortcut, ensuring they always use the main corridors.
+    for cy in range(height):
+        blocked.add((0, cy))
+
     return resolution, width, height, origin_x, origin_y, blocked

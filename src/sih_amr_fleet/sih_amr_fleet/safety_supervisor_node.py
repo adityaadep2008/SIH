@@ -74,10 +74,9 @@ class SafetySupervisorNode(Node):
         age = now_seconds(self) - self.pose_time
         scan_age = now_seconds(self) - self.scan_time
         requested_speed = abs(self.candidate.linear.x)
-        measured_braking = max(
+        measured_braking = (
             self.measured_speed * self.measured_speed /
-            (2.0 * max(self.deceleration, 1e-6)) + self.margin,
-            0.30)
+            (2.0 * max(self.deceleration, 1e-6)) + self.margin)
         invalid_command = not finite_command(self.candidate.linear.x, self.candidate.angular.z)
         travel_clearance = self.directional_clearance(self.candidate.linear.x)
         stop = (self.estop or invalid_command or age > self.localization_timeout_s or scan_age > self.scan_timeout_s
