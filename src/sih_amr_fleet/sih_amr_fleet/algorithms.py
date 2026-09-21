@@ -338,6 +338,11 @@ def whca_star(start, goal, blocked, reservations, width, height, horizon,
     parent = {}
     cost = {(start[0], start[1], 0): 0}
 
+    start_res_dist = {}
+    for rx, ry, rt in reservations:
+        if rt == 0:
+            start_res_dist[(rx, ry)] = max(abs(start[0] - rx), abs(start[1] - ry))
+
     while queue:
         _, g, x, y, t = heapq.heappop(queue)
         state = (x, y, t)
@@ -354,12 +359,18 @@ def whca_star(start, goal, blocked, reservations, width, height, horizon,
             candidate = (nx, ny, nt)
             if not (0 <= nx < width and 0 <= ny < height) or (nx, ny) in blocked:
                 continue
-            reserved_neighbourhood = any(
-                (rx, ry, nt) in reservations
-                for rx in range(nx - reservation_buffer_cells, nx + reservation_buffer_cells + 1)
-                for ry in range(ny - reservation_buffer_cells, ny + reservation_buffer_cells + 1)
-            )
-            if reserved_neighbourhood or (nx, ny, t) in reservations and (x, y, nt) in reservations:
+            conflict = False
+            for rx, ry, rt in reservations:
+                if rt == nt:
+                    if (nx, ny) == (rx, ry):
+                        conflict = True
+                        break
+                    d_start = start_res_dist.get((rx, ry), math.inf)
+                    eff_buf = min(reservation_buffer_cells, max(0, d_start - 1)) if d_start <= reservation_buffer_cells else reservation_buffer_cells
+                    if max(abs(nx - rx), abs(ny - ry)) <= eff_buf:
+                        conflict = True
+                        break
+            if conflict or (nx, ny, t) in reservations and (x, y, nt) in reservations:
                 continue
             turn_penalty = 0.0
             if (dx, dy) != (0, 0):

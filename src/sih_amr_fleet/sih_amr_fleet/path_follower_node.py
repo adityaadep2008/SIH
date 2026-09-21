@@ -35,6 +35,11 @@ class PathFollowerNode(Node):
         self.recovery_start_pose = None
         self.recovery_cooldown_until = 0.0
         self.safety_stop_started = None
+        self.measured_speed = 0.0
+        self._last_pose = None
+        self._last_pose_time = None
+        self.peers = {}
+        self.stall_started = None
         self.session_id, self.sequence = new_session_id(), 0
         self._received_local_state = False
         self.pub = self.create_publisher(Twist, 'cmd_vel_desired', FLEET_STATE_QOS)
@@ -54,12 +59,35 @@ class PathFollowerNode(Node):
         self.create_subscription(TaskExecutionStatus, 'task_execution_status', self.on_execution, FLEET_STATE_QOS)
         self.create_timer(0.1, self.control)
 
+    def _update_local_pose_and_speed(self, pose, twist):
+        now = now_seconds(self)
+        self.pose = pose
+        twist_speed = math.hypot(twist.linear.x, twist.linear.y)
+        if self._last_pose is not None and self._last_pose_time is not None:
+            dt = now - self._last_pose_time
+            if dt >= 0.04:
+                dp = math.hypot(pose.x - self._last_pose.x, pose.y - self._last_pose.y)
+                pose_speed = dp / dt
+                self.measured_speed = max(twist_speed, pose_speed)
+                self._last_pose = pose
+                self._last_pose_time = now
+        else:
+            self._last_pose = pose
+            self._last_pose_time = now
+            self.measured_speed = twist_speed
+
     def on_state(self, msg):
-        if msg.fleet_header.robot_id == self.robot_id:
-            self.pose = msg.pose
+        rid = msg.fleet_header.robot_id
+        if rid == self.robot_id:
+            self._update_local_pose_and_speed(msg.pose, msg.twist)
+        else:
+            self.peers[rid] = {
+                'pose': msg.pose,
+                'last_seen': now_seconds(self),
+            }
     def on_local_state(self, msg):
         if msg.localization_valid:
-            self.pose = msg.pose
+            self._update_local_pose_and_speed(msg.pose, msg.twist)
             if not self._received_local_state:
                 self._received_local_state = True
                 self.get_logger().info('Path follower received first local RobotState sample')
@@ -158,6 +186,7 @@ class PathFollowerNode(Node):
                 else:
                     self.recovery_state = 'IDLE'
                     self.recovery_cooldown_until = now + self.recovery_cooldown_s
+                    self.route = None
                     self.publish_event('recovery_blocked', 'unsafe reverse rejected')
         elif self.recovery_state == 'REVERSING':
             distance = 0.0 if self.pose is None or self.recovery_start_pose is None else math.hypot(
@@ -166,10 +195,12 @@ class PathFollowerNode(Node):
             if distance >= self.recovery_reverse_m:
                 self.recovery_state = 'IDLE'
                 self.recovery_cooldown_until = now + self.recovery_cooldown_s
+                self.route = None
                 self.publish_event('recovery_retreat_complete', f'reversed={distance:.2f}m; requesting normal replanning')
             elif now - self.recovery_started >= timeout:
                 self.recovery_state = 'IDLE'
                 self.recovery_cooldown_until = now + self.recovery_cooldown_s
+                self.route = None
                 self.publish_event('recovery_blocked', f'retreat timed out after {distance:.2f}m')
             else:
                 cmd.linear.x = -self.recovery_speed_mps
@@ -212,6 +243,39 @@ class PathFollowerNode(Node):
                 f'Info: phase={self.execution_phase} (dwelling at station).',
                 throttle_duration_sec=5.0
             )
+        # Check for persistent ORCA/obstacle stall while attempting forward motion
+        is_attempting_forward = (
+            self.pose is not None and self.clear and not self.hold and cmd.linear.x > 0.05
+        )
+        conflicting_peer = None
+        if self.pose is not None:
+            for pid, pinfo in self.peers.items():
+                if now - pinfo['last_seen'] < 3.0:
+                    dist = math.hypot(pinfo['pose'].x - self.pose.x, pinfo['pose'].y - self.pose.y)
+                    if dist < 3.0:
+                        conflicting_peer = pid
+                        break
+
+        is_stalled = (
+            is_attempting_forward and
+            self.measured_speed < 0.05 and
+            conflicting_peer is not None
+        )
+        if is_stalled:
+            if self.stall_started is None:
+                self.stall_started = now
+            elif (now - self.stall_started >= 2.5 and
+                  self.recovery_state == 'IDLE' and
+                  now >= self.recovery_cooldown_until):
+                # Break symmetry: lower-priority AMR (higher robot_id) initiates retreat/replan
+                is_yielder = (conflicting_peer < self.robot_id) if conflicting_peer else True
+                if is_yielder:
+                    self.recovery_state, self.recovery_started = 'VERIFY', now
+                    self.publish_event('recovery_stop', f'stall detected with peer {conflicting_peer or "obstacle"}')
+                    self.stall_started = None
+        else:
+            self.stall_started = None
+
         self.pub.publish(cmd)
 
 

@@ -23,6 +23,8 @@ class LocalizationNode(Node):
         self.session_id, self.sequence = new_session_id(), 0
         self.dock_anchors = {}
         self.last_raw_odom = None
+        self.last_odom_time = None
+        self.last_map_pos = None
         if not self.map_file or not pathlib.Path(self.map_file).exists():
             try:
                 from ament_index_python.packages import get_package_share_directory
@@ -71,18 +73,37 @@ class LocalizationNode(Node):
         local_x, local_y = odom.pose.pose.position.x, odom.pose.pose.position.y
         self.last_raw_odom = (local_x, local_y, yaw_from_quaternion(odom.pose.pose.orientation))
         cosine, sine = math.cos(self.odom_origin_yaw), math.sin(self.odom_origin_yaw)
+        map_x = self.odom_origin_x + cosine * local_x - sine * local_y
+        map_y = self.odom_origin_y + sine * local_x + cosine * local_y
         msg = RobotState()
         msg.fleet_header = header(self, self.robot_id, self.session_id, self.sequence, 0.5)
         msg.pose = Pose2D(
-            x=self.odom_origin_x + cosine * local_x - sine * local_y,
-            y=self.odom_origin_y + sine * local_x + cosine * local_y,
+            x=map_x,
+            y=map_y,
             theta=wrap_angle(self.odom_origin_yaw + yaw_from_quaternion(odom.pose.pose.orientation)))
         # nav_msgs/Odometry expresses twist in child_frame_id (base_link for
         # these AMRs).  Fleet consumers predict peers in the map frame, so a
         # body-forward velocity cannot be copied and mislabeled as map +x.
         body_twist = odom.twist.twist
-        map_vx, map_vy = body_velocity_to_map(
-            body_twist.linear.x, body_twist.linear.y, msg.pose.theta)
+        raw_speed = math.hypot(body_twist.linear.x, body_twist.linear.y)
+        if raw_speed > 0.01:
+            map_vx, map_vy = body_velocity_to_map(
+                body_twist.linear.x, body_twist.linear.y, msg.pose.theta)
+        else:
+            now_sec = odom.header.stamp.sec + odom.header.stamp.nanosec * 1e-9
+            if now_sec == 0.0:
+                now_sec = now_seconds(self)
+            if self.last_odom_time is not None and self.last_map_pos is not None and now_sec > self.last_odom_time:
+                dt = now_sec - self.last_odom_time
+                if dt >= 0.02:
+                    map_vx = (map_x - self.last_map_pos[0]) / dt
+                    map_vy = (map_y - self.last_map_pos[1]) / dt
+                else:
+                    map_vx, map_vy = 0.0, 0.0
+            else:
+                map_vx, map_vy = 0.0, 0.0
+            self.last_odom_time = now_sec
+            self.last_map_pos = (map_x, map_y)
         msg.twist = Twist()
         msg.twist.linear.x = map_vx
         msg.twist.linear.y = map_vy

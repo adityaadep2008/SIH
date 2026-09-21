@@ -363,6 +363,11 @@ def test_orca_node_clamping_and_priority_halt():
         node.control()
         assert published[-1].linear.x == 0.0, 'Zero desired must produce zero output!'
 
+        # Reverse retreat velocity passes through safely
+        node.desired.linear.x = -0.20
+        node.control()
+        assert published[-1].linear.x == -0.20, 'Negative retreat velocity must pass through!'
+
         node.destroy_node()
     finally:
         if shutdown_after and rclpy.ok():
@@ -1218,7 +1223,10 @@ def test_outer_west_wall_column_is_blocked():
 
 def test_western_shelf_path_exits_east_never_west_wall():
     """Verify that a path from a western shelf exits east towards main corridor and never visits cx=0."""
-    with open('warehouse_layout.lock.yaml', 'r') as f:
+    layout_path = pathlib.Path(__file__).parents[3] / 'warehouse_layout.lock.yaml'
+    if not layout_path.exists():
+        layout_path = pathlib.Path('warehouse_layout.lock.yaml')
+    with open(layout_path, 'r') as f:
         layout = yaml.safe_load(f)
     resolution, width, height, origin_x, origin_y, blocked = map_geometry_from_data(layout)
     # Start at western shelf aisle cell (1, 25), goal at main corridor cell (30, 25)
@@ -1267,6 +1275,228 @@ def test_safety_supervisor_node_enforce():
         node.enforce()
     finally:
         node.destroy_node()
+
+
+def test_corridor_mutex_throat_sweep_protection():
+    """Verify that CorridorMutexNode protects the junction throat sweep until AMR clears the mouth."""
+    import rclpy
+    from sih_amr_fleet.corridor_mutex_node import CorridorMutexNode
+    from sih_amr_interfaces.msg import RobotState
+    from geometry_msgs.msg import Pose2D
+
+    if not rclpy.ok():
+        rclpy.init()
+    node = CorridorMutexNode()
+    try:
+        node.origin_x = -22.5
+        node.origin_y = -30.0
+        node.resolution = 0.5
+        node.corridors['NC-TEST'] = {(x, 50) for x in range(60, 89)}
+        node.corridor_meta['NC-TEST'] = {
+            'axis': 'x',
+            'min_x': 60, 'max_x': 88,
+            'min_y': 50, 'max_y': 50,
+        }
+
+        # Simulate entered and inside corridor
+        node.request = {
+            'corridor': 'NC-TEST',
+            'id': 'req-test-1',
+            'ts': 1,
+            'grants': {'robot_2'},
+            'entered': True,
+            'was_inside': True,
+            'created_at': node.get_clock().now().nanoseconds * 1e-9,
+        }
+
+        state = RobotState()
+        state.fleet_header.robot_id = 'robot_1'
+
+        # Case 1: AMR is inside aisle at x=10.0 (cell 65), y=-5.0 (cell 50)
+        state.pose = Pose2D(x=10.0, y=-5.0, theta=3.14)
+        node.on_state(state)
+        assert node.request is not None, "AMR inside aisle must retain mutex"
+
+        # Case 2: AMR moves into junction throat at x=6.5 (cell 58, 2 cells away from min_x 60)
+        # y=-5.0 (still aligned with aisle centreline). Under the old logic this would release mutex!
+        state.pose = Pose2D(x=6.5, y=-5.0, theta=3.14)
+        node.on_state(state)
+        assert node.request is not None, "AMR in throat sweep must retain mutex until turning or clearing"
+
+        # Case 3: AMR turns North into corridor: x=6.5, y=-3.5 (dist_y = 1.5m >= 0.8m)
+        state.pose = Pose2D(x=6.5, y=-3.5, theta=1.57)
+        node.on_state(state)
+        assert node.request is None, "AMR that turned into cross corridor must release mutex with EXIT"
+    finally:
+        node.destroy_node()
+
+
+def test_whca_stationary_peer_4d_reservation():
+    """Verify that WhcaPlannerNode routes around a stationary peer via 4D reservations without static 2D blockage."""
+    import rclpy
+    from geometry_msgs.msg import Pose2D, Twist
+    from sih_amr_fleet.whca_planner_node import WhcaPlannerNode
+    from sih_amr_interfaces.msg import FleetHeader, RobotState, Task, TaskAssignment
+
+    if not rclpy.ok():
+        rclpy.init()
+    node = WhcaPlannerNode()
+    try:
+        layout_path = pathlib.Path(__file__).parents[3] / 'warehouse_layout.lock.yaml'
+        if not layout_path.exists():
+            layout_path = pathlib.Path('warehouse_layout.lock.yaml')
+        node.load_map(str(layout_path))
+        node.robot_id = 'robot_2'
+        node.pose = Pose2D(x=6.0, y=-1.5, theta=-1.57)
+
+        assignment = TaskAssignment()
+        assignment.task = Task()
+        assignment.task.task_id = 'test_avoid_4d'
+        assignment.task.pickup = Pose2D(x=6.0, y=-7.5, theta=0.0)
+        node.assignment = assignment
+        node.execution_task_id = 'test_avoid_4d'
+
+        # Peer (robot_4) is stationary directly ahead at (6.0, -4.0) [cell (57, 52)]
+        peer_state = RobotState()
+        peer_state.fleet_header = FleetHeader(robot_id='robot_4')
+        peer_state.pose = Pose2D(x=6.0, y=-4.0, theta=1.57)
+        peer_state.twist = Twist()
+        peer_state.localization_valid = True
+
+        node.on_state(peer_state)
+        now = node.get_clock().now().nanoseconds * 1e-9
+        node.peer_tracking['robot_4']['stopped_since'] = now - 2.5
+        node.peer_tracking['robot_4']['last_seen'] = now
+
+        node.plan()
+        assert node.plan_id > 0, "Plan should be generated"
+        # Peer cell (57, 52) must be in reservations for t in [0, 12]
+        peer_cell = node.to_cell(peer_state.pose)
+        # Static blocked should NOT contain peer cell (graph connectivity preserved)
+        assert peer_cell not in node.static_blocked
+    finally:
+        node.destroy_node()
+
+
+def test_path_follower_orca_stall_detection_and_yield():
+    """Verify that PathFollowerNode detects ORCA stalls and breaks symmetry based on priority."""
+    import rclpy
+    from geometry_msgs.msg import Point, Pose2D
+    from sih_amr_fleet.path_follower_node import PathFollowerNode
+    from sih_amr_interfaces.msg import RoutePlan
+
+    if not rclpy.ok():
+        rclpy.init()
+
+    # Robot 4: lower priority than robot_2 -> should initiate recovery
+    node4 = PathFollowerNode()
+    try:
+        node4.robot_id = 'robot_4'
+        node4.pose = Pose2D(x=6.0, y=-5.0, theta=1.57)
+        node4.reverse_clearance = 4.0
+
+        route = RoutePlan()
+        route.route_feasible = True
+        for y in (-4.0, -3.0, -2.0):
+            p = Point()
+            p.x = 6.0
+            p.y = float(y)
+            route.waypoints.append(p)
+        node4.route = route
+
+        now = node4.get_clock().now().nanoseconds * 1e-9
+        node4.peers['robot_2'] = {
+            'pose': Pose2D(x=6.0, y=-3.5, theta=-1.57),
+            'last_seen': now,
+        }
+        node4.measured_speed = 0.0
+        node4.nearest = 1.5
+
+        # First tick: starts stall timer
+        node4.control()
+        assert node4.stall_started is not None
+        assert node4.recovery_state == 'IDLE'
+
+        # Fast forward time by 3 seconds
+        node4.stall_started = now - 3.0
+        node4.control()
+        # Robot 4 yields (robot_2 < robot_4) -> transitions to VERIFY
+        assert node4.recovery_state == 'VERIFY'
+    finally:
+        node4.destroy_node()
+
+    # Robot 2: higher priority than robot_4 -> should NOT yield
+    node2 = PathFollowerNode()
+    try:
+        node2.robot_id = 'robot_2'
+        node2.pose = Pose2D(x=6.0, y=-3.5, theta=-1.57)
+        node2.reverse_clearance = 4.0
+
+        route2 = RoutePlan()
+        route2.route_feasible = True
+        for y in (-4.5, -5.5, -6.5):
+            p = Point()
+            p.x = 6.0
+            p.y = float(y)
+            route2.waypoints.append(p)
+        node2.route = route2
+
+        now = node2.get_clock().now().nanoseconds * 1e-9
+        node2.peers['robot_4'] = {
+            'pose': Pose2D(x=6.0, y=-5.0, theta=1.57),
+            'last_seen': now,
+        }
+        node2.measured_speed = 0.0
+        node2.nearest = 1.5
+
+        node2.control()
+        node2.stall_started = now - 3.0
+        node2.control()
+        # Robot 2 does NOT yield (robot_4 is not < robot_2) -> stays IDLE
+        assert node2.recovery_state == 'IDLE'
+    finally:
+        node2.destroy_node()
+
+
+def test_whca_reservation_buffer_bypass():
+    """Verify that WHCA* with reservation_buffer_cells=3 steps laterally around a stationary peer in a wide corridor."""
+    from sih_amr_fleet.algorithms import whca_star
+
+    start = (33, 10)
+    goal = (33, 0)
+    peer = (33, 5)
+    reservations = set((peer[0], peer[1], t) for t in range(12))
+
+    path = whca_star(start, goal, blocked=set(), reservations=reservations,
+                     width=90, height=120, horizon=12, reservation_buffer_cells=3, heading_rad=-1.57)
+    assert len(path) > 0, "Path must be feasible"
+    # AMR must step laterally (nx != 33) to maintain buffer from peer at (33, 5)
+    lateral_steps = [p for p in path if p[0] != 33]
+    assert len(lateral_steps) > 0, "WHCA* must plan a lateral bypass around the peer"
+    # Minimum Chebyshev distance to peer at time matching peer reservation must be > 0
+    for p in path:
+        dist_to_peer = max(abs(p[0] - peer[0]), abs(p[1] - peer[1]))
+        assert dist_to_peer >= 2, f"Path at t={p[2]} violates safety separation: dist={dist_to_peer}"
+
+
+def test_whca_adaptive_escape_when_inside_buffer():
+    """Verify that an AMR starting inside a peer's reservation buffer escapes sideways/away rather than failing."""
+    from sih_amr_fleet.algorithms import whca_star
+
+    start = (33, 7)  # Distance 2 from peer at (33, 5) while buffer=3
+    goal = (50, 7)
+    peer = (33, 5)
+    reservations = set((peer[0], peer[1], t) for t in range(12))
+
+    path = whca_star(start, goal, blocked=set(), reservations=reservations,
+                     width=90, height=120, horizon=12, reservation_buffer_cells=3, heading_rad=-1.57)
+    assert len(path) > 0, "AMR inside buffer must be allowed to escape"
+    # Step at t=1 must NOT move closer to peer
+    p1 = path[1]
+    d1 = max(abs(p1[0] - peer[0]), abs(p1[1] - peer[1]))
+    assert d1 >= 2, f"AMR must not move closer to peer: d1={d1}"
+
+
 
 
 

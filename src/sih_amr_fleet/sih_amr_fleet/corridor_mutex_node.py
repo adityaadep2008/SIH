@@ -294,8 +294,29 @@ class CorridorMutexNode(Node):
         if not self.request or not self.request['entered']:
             return
         corridor_cells = self.corridors.get(self.request['corridor'], set())
+        meta = self.corridor_meta.get(self.request['corridor'], {})
+        axis = meta.get('axis', 'x')
+        in_throat_sweep = False
+        if axis == 'x' and 'min_y' in meta:
+            y_center = self.origin_y + meta['min_y'] * self.resolution
+            x_min_m = self.origin_x + meta['min_x'] * self.resolution
+            x_max_m = self.origin_x + meta['max_x'] * self.resolution
+            dist_y = abs(state.pose.y - y_center)
+            dist_x_ends = min(abs(state.pose.x - x_min_m), abs(state.pose.x - x_max_m))
+            if dist_y < 0.8 and dist_x_ends <= 1.5:
+                in_throat_sweep = True
+        elif axis == 'y' and 'min_x' in meta:
+            x_center = self.origin_x + meta['min_x'] * self.resolution
+            y_min_m = self.origin_y + meta['min_y'] * self.resolution
+            y_max_m = self.origin_y + meta['max_y'] * self.resolution
+            dist_x = abs(state.pose.x - x_center)
+            dist_y_ends = min(abs(state.pose.y - y_min_m), abs(state.pose.y - y_max_m))
+            if dist_x < 0.8 and dist_y_ends <= 1.5:
+                in_throat_sweep = True
+
         inside_corridor = (
             cell in corridor_cells or
+            in_throat_sweep or
             any((cx == cell[0] and abs(cy - cell[1]) <= 1) or
                 (cy == cell[1] and abs(cx - cell[0]) <= 1)
                 for cx, cy in corridor_cells)

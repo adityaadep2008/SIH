@@ -1,3 +1,4 @@
+import math
 import pathlib
 import yaml
 import rclpy
@@ -26,7 +27,7 @@ class WhcaPlannerNode(Node):
         map_file = self.declare_parameter('map_file', '').value
         self.resolution = self.declare_parameter('grid_resolution_m', 0.5).value
         self.horizon = self.declare_parameter('horizon_steps', 12).value
-        self.reservation_buffer_cells = self.declare_parameter('reservation_buffer_cells', 1).value
+        self.reservation_buffer_cells = self.declare_parameter('reservation_buffer_cells', 3).value
 
         self.session_id = new_session_id()
         self.sequence = 0
@@ -52,6 +53,7 @@ class WhcaPlannerNode(Node):
 
         self.corridors = {}
         self.occupied_corridors = {}
+        self.peer_tracking = {}
 
         if map_file:
             self.load_map(map_file)
@@ -126,9 +128,28 @@ class WhcaPlannerNode(Node):
                 self.occupied_corridors.pop(msg.fleet_header.robot_id, None)
 
     def on_state(self, msg):
-        if msg.fleet_header.robot_id != self.robot_id:
+        rid = msg.fleet_header.robot_id
+        if rid == self.robot_id:
+            self.pose = msg.pose
             return
-        self.pose = msg.pose
+        speed = math.hypot(msg.twist.linear.x, msg.twist.linear.y)
+        now = now_seconds(self)
+        prev = self.peer_tracking.get(rid)
+        if prev is None or speed >= 0.08:
+            self.peer_tracking[rid] = {
+                'pose': msg.pose,
+                'speed': speed,
+                'stopped_since': None,
+                'last_seen': now,
+            }
+        else:
+            stopped_since = prev['stopped_since'] if prev.get('stopped_since') is not None else now
+            self.peer_tracking[rid] = {
+                'pose': msg.pose,
+                'speed': speed,
+                'stopped_since': stopped_since,
+                'last_seen': now,
+            }
 
     def on_local_state(self, msg):
         if not msg.localization_valid:
@@ -243,6 +264,14 @@ class WhcaPlannerNode(Node):
         for intent in list(self.peer_intents.values()):
             if stamp_seconds(intent.fleet_header.valid_until) >= now:
                 reservations.update((cell.x, cell.y, cell.time_slot) for cell in intent.reservations)
+
+        # 4D space-time reservations for stationary peers
+        for rid, info in self.peer_tracking.items():
+            if now - info['last_seen'] < 3.0 and info['stopped_since'] is not None:
+                if now - info['stopped_since'] >= 1.0:
+                    peer_cell = self.to_cell(info['pose'])
+                    for t in range(min(self.horizon, 12)):
+                        reservations.add((peer_cell[0], peer_cell[1], t))
 
         # Global LiDAR reports include this robot as observed by peers.  Never
         # let that coarse representation block the robot's own current

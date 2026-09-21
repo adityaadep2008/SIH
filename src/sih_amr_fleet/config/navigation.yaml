@@ -5,8 +5,8 @@ planner:
   type: "WHCA_star"
   horizon_steps: 12
   time_slot_seconds: 0.125
-  reservation_buffer_cells: 1
-  reservation_buffer_shape: "chebyshev_3x3_same_time_slot"
+  reservation_buffer_cells: 3
+  reservation_buffer_shape: "chebyshev_7x7_same_time_slot"
 
 path_follower:
   linear_kp: 12.0
