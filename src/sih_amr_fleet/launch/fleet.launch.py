@@ -20,7 +20,8 @@ DOCK_POSES = [
 
 
 def robot_group(robot_id, map_file, pad_pose, tracking_speed, reservation_slot, enable_faults, enable_vision, random_seed, expected_robot_ids, consolidated=True):
-    dock_idx = robot_id.rsplit('_', 1)[-1]
+    # Find matching charging pad ID by X-coordinate
+    dock_num = min(range(len(DOCK_POSES)), key=lambda k: abs(DOCK_POSES[k][0] - pad_pose[0])) + 1
     params = {
         'robot_id': robot_id,
         'map_file': map_file,
@@ -37,7 +38,7 @@ def robot_group(robot_id, map_file, pad_pose, tracking_speed, reservation_slot, 
         'lidar_y_in_base_m': 0.0,
         'lidar_yaw_in_base_rad': 1.5707963267948966,
         'pad_x': pad_pose[0], 'pad_y': pad_pose[1], 'pad_yaw': -1.5708,
-        'dock_id': f'charging_pad_{dock_idx}',
+        'dock_id': f'charging_pad_{dock_num}',
         'odom_origin_x': pad_pose[0], 'odom_origin_y': pad_pose[1],
         'odom_origin_yaw': -1.5708,
         'random_seed': random_seed,
@@ -110,7 +111,14 @@ def generate_launch_description():
 
     # Instantiate robot agents for each AMR in the fleet
     for i in range(1, fleet_count + 1):
-        pad_coord = DOCK_POSES[i - 1]
+        env_x = os.environ.get(f'ROBOT_{i}_X')
+        env_y = os.environ.get(f'ROBOT_{i}_Y')
+        if env_x is not None and env_y is not None:
+            pad_coord = (float(env_x), float(env_y))
+        elif fleet_count <= 4:
+            pad_coord = DOCK_POSES[(i - 1) * 2]
+        else:
+            pad_coord = DOCK_POSES[i - 1]
         launch_items.append(
             robot_group(f'robot_{i}', map_file, pad_coord, tracking_speed_value,
                         reservation_slot_value, enable_faults_value, enable_vision_value,

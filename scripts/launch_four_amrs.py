@@ -28,9 +28,9 @@ LOG_BASE_DIR = WORKSPACE / "log" / "four_amr_runs"
 # Default charging pad spawn poses (South wall charging bay, facing North +Y / yaw = 1.5708)
 CHARGING_PAD_SPAWNS = [
     {"robot_id": "robot_1", "x": -5.25, "y": -29.55, "z": 0.05, "yaw": 1.5708},
-    {"robot_id": "robot_2", "x": -3.75, "y": -29.55, "z": 0.05, "yaw": 1.5708},
-    {"robot_id": "robot_3", "x": -2.25, "y": -29.55, "z": 0.05, "yaw": 1.5708},
-    {"robot_id": "robot_4", "x": -0.75, "y": -29.55, "z": 0.05, "yaw": 1.5708},
+    {"robot_id": "robot_2", "x": -2.25, "y": -29.55, "z": 0.05, "yaw": 1.5708},
+    {"robot_id": "robot_3", "x": 0.75, "y": -29.55, "z": 0.05, "yaw": 1.5708},
+    {"robot_id": "robot_4", "x": 3.75, "y": -29.55, "z": 0.05, "yaw": 1.5708},
 ]
 
 # Track child processes for clean termination

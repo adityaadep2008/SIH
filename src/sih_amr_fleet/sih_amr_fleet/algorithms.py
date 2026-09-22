@@ -111,8 +111,12 @@ def approach_policy(in_approach_zone, has_permit, communication_degraded, approa
 
 def reverse_recovery_allowed(nearest_obstacle_m, reverse_distance_m,
                              margin_m, inside_protected_resource, dock_claimed):
-    """A deliberately pessimistic precondition for a reverse recovery move."""
-    return (not inside_protected_resource and not dock_claimed
+    """Return whether a reverse recovery move is safe given verified clearances.
+
+    Allows retreat inside protected corridors if rear clearance is verified,
+    enabling AMRs to back out of dead-ends or blocked aisles to release mutexes.
+    """
+    return (not dock_claimed
             and nearest_obstacle_m > reverse_distance_m + margin_m)
 
 
@@ -497,8 +501,13 @@ def avoidance_velocity(preferred, self_xy, peers, radius, horizon, max_speed, se
 
         if v_rel_sq > 1e-6:
             t_cpa = closing / v_rel_sq
+            rx_cpa = dx + t_cpa * v_rel_x
+            ry_cpa = dy + t_cpa * v_rel_y
+            d_cpa = math.hypot(rx_cpa, ry_cpa)
             t_star = max(0.0, min(t_cpa, horizon))
         else:
+            t_cpa = horizon
+            d_cpa = separation
             t_star = horizon
 
         rx = dx + t_star * v_rel_x

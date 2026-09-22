@@ -34,6 +34,7 @@ class PathFollowerNode(Node):
         self.recovery_state, self.recovery_started = 'IDLE', 0.0
         self.recovery_start_pose = None
         self.recovery_cooldown_until = 0.0
+        self.recovery_stand_down_until = 0.0
         self.safety_stop_started = None
         self.measured_speed = 0.0
         self._last_pose = None
@@ -83,6 +84,8 @@ class PathFollowerNode(Node):
         else:
             self.peers[rid] = {
                 'pose': msg.pose,
+                'twist': msg.twist,
+                'speed': math.hypot(msg.twist.linear.x, msg.twist.linear.y),
                 'last_seen': now_seconds(self),
             }
     def on_local_state(self, msg):
@@ -191,19 +194,47 @@ class PathFollowerNode(Node):
         elif self.recovery_state == 'REVERSING':
             distance = 0.0 if self.pose is None or self.recovery_start_pose is None else math.hypot(
                 self.pose.x - self.recovery_start_pose[0], self.pose.y - self.recovery_start_pose[1])
-            timeout = 1.5 * self.recovery_reverse_m / max(self.recovery_speed_mps, 0.01) + 1.0
-            if distance >= self.recovery_reverse_m:
-                self.recovery_state = 'IDLE'
+            timeout = max(25.0, 2.5 * self.recovery_reverse_m / max(self.recovery_speed_mps, 0.01) + 1.0)
+
+            peer_dist = math.inf
+            if self.pose is not None:
+                for pinfo in self.peers.values():
+                    if now - pinfo['last_seen'] < 3.0:
+                        d = math.hypot(pinfo['pose'].x - self.pose.x, pinfo['pose'].y - self.pose.y)
+                        if d < peer_dist:
+                            peer_dist = d
+
+            if distance >= self.recovery_reverse_m or (distance >= 1.0 and peer_dist >= 2.5):
+                self.recovery_state = 'STAND_DOWN'
+                self.recovery_stand_down_until = now + 8.0
                 self.recovery_cooldown_until = now + self.recovery_cooldown_s
                 self.route = None
-                self.publish_event('recovery_retreat_complete', f'reversed={distance:.2f}m; requesting normal replanning')
+                self.publish_event('recovery_retreat_complete', f'reversed={distance:.2f}m; standing down')
             elif now - self.recovery_started >= timeout:
-                self.recovery_state = 'IDLE'
+                self.recovery_state = 'STAND_DOWN'
+                self.recovery_stand_down_until = now + 8.0
                 self.recovery_cooldown_until = now + self.recovery_cooldown_s
                 self.route = None
-                self.publish_event('recovery_blocked', f'retreat timed out after {distance:.2f}m')
+                self.publish_event('recovery_blocked', f'retreat timed out after {distance:.2f}m; standing down')
             else:
                 cmd.linear.x = -self.recovery_speed_mps
+        elif self.recovery_state == 'STAND_DOWN':
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            peer_cleared = True
+            if self.pose is not None:
+                for pinfo in self.peers.values():
+                    if now - pinfo['last_seen'] < 3.0:
+                        dx = pinfo['pose'].x - self.pose.x
+                        dy = pinfo['pose'].y - self.pose.y
+                        dist = math.hypot(dx, dy)
+                        along = dx * math.cos(self.pose.theta) + dy * math.sin(self.pose.theta)
+                        if along > -0.2 and dist < 3.2:
+                            peer_cleared = False
+                            break
+            if (peer_cleared and (now - self.recovery_started >= 1.5)) or now >= self.recovery_stand_down_until:
+                self.recovery_state = 'IDLE'
+                self.route = None
         elif self.pose is not None and self.docking_final and self.docking_target and self.clear:
             cmd = self.steer_to(self.docking_target, self.final_docking_speed_mps, 0.8)
             self.get_logger().info(

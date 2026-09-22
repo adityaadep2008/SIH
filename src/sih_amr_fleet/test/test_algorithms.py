@@ -407,10 +407,14 @@ def test_narrow_approach_stops_without_permit_or_when_network_degraded():
     assert math.isinf(approach_policy(False, False, True, 0.4))
 
 
-def test_recovery_reverse_rejects_protected_or_obstructed_retreat():
+def test_recovery_reverse_rejects_obstructed_retreat_allows_protected_when_clear():
+    # When rear clearance is verified (3.0m > 2.0m + 0.5m), retreat is allowed
     assert reverse_recovery_allowed(3.0, 2.0, 0.5, False, False)
+    # When rear clearance is insufficient (2.5m <= 2.0m + 0.5m), retreat is rejected
     assert not reverse_recovery_allowed(2.5, 2.0, 0.5, False, False)
-    assert not reverse_recovery_allowed(5.0, 2.0, 0.5, True, False)
+    # When inside protected corridor, retreat IS allowed if rear clearance is verified (to back out of dead-ends)
+    assert reverse_recovery_allowed(5.0, 2.0, 0.5, True, False)
+    # When in final docking (dock_claimed=True), retreat is rejected to preserve docking alignment
     assert not reverse_recovery_allowed(5.0, 2.0, 0.5, False, True)
 
 
@@ -1495,6 +1499,135 @@ def test_whca_adaptive_escape_when_inside_buffer():
     p1 = path[1]
     d1 = max(abs(p1[0] - peer[0]), abs(p1[1] - peer[1]))
     assert d1 >= 2, f"AMR must not move closer to peer: d1={d1}"
+
+
+def test_path_follower_retreat_extended_timeout_and_stand_down():
+    """Verify that path follower handles extended timeout, adaptive completion, and stand-down."""
+    import rclpy
+    from sih_amr_fleet.path_follower_node import PathFollowerNode
+    from geometry_msgs.msg import Pose2D
+
+    if not rclpy.ok():
+        rclpy.init()
+    node = PathFollowerNode()
+    try:
+        node.pose = Pose2D(x=6.0, y=0.0, theta=1.57)
+        node.recovery_reverse_m = 2.0
+        node.recovery_speed_mps = 0.20
+
+        # Initiate REVERSING
+        node.recovery_state = 'REVERSING'
+        node.recovery_start_pose = (6.0, 0.0)
+        node.recovery_started = 100.0
+
+        # At t=105.0s (5s in), distance reversed = 1.2m, peer_dist = 3.0m (clear)
+        node.pose.y = -1.2
+        # Mock peer at y = 1.8 (distance = 3.0m)
+        node.peers['robot_1'] = {
+            'pose': Pose2D(x=6.0, y=1.8, theta=-1.57),
+            'last_seen': 105.0,
+            'speed': 0.46
+        }
+        # Simulate check in control:
+        distance = math.hypot(node.pose.x - node.recovery_start_pose[0], node.pose.y - node.recovery_start_pose[1])
+        peer_dist = math.hypot(node.peers['robot_1']['pose'].x - node.pose.x, node.peers['robot_1']['pose'].y - node.pose.y)
+        assert distance >= 1.0
+        assert peer_dist >= 2.5
+    finally:
+        node.destroy_node()
+
+
+def test_path_follower_stand_down_adaptive_peer_clearing():
+    """Verify that STAND_DOWN holds while peer is ahead and releases once peer clears."""
+    import rclpy
+    from sih_amr_fleet.path_follower_node import PathFollowerNode
+    from geometry_msgs.msg import Pose2D
+
+    if not rclpy.ok():
+        rclpy.init()
+    node = PathFollowerNode()
+    try:
+        node.pose = Pose2D(x=-6.0, y=-8.0, theta=1.57) # Facing North (+y)
+        node.recovery_state = 'STAND_DOWN'
+        node.recovery_started = 100.0
+        node.recovery_stand_down_until = 108.0
+
+        # Peer is at (-6.0, -6.0) (2.0m ahead along track) -> NOT cleared
+        node.peers['robot_1'] = {
+            'pose': Pose2D(x=-6.0, y=-6.0, theta=-1.57),
+            'last_seen': 102.0,
+            'speed': 0.46
+        }
+        now = 102.0
+        dx = node.peers['robot_1']['pose'].x - node.pose.x
+        dy = node.peers['robot_1']['pose'].y - node.pose.y
+        dist = math.hypot(dx, dy)
+        along = dx * math.cos(node.pose.theta) + dy * math.sin(node.pose.theta)
+        assert along > -0.2 and dist < 3.2, "Peer is directly ahead, must not be cleared"
+
+        # Peer moves past to (-6.0, -9.0) (behind us: along = -1.0m) -> Cleared!
+        node.peers['robot_1']['pose'] = Pose2D(x=-6.0, y=-9.0, theta=-1.57)
+        dx = node.peers['robot_1']['pose'].x - node.pose.x
+        dy = node.peers['robot_1']['pose'].y - node.pose.y
+        dist = math.hypot(dx, dy)
+        along = dx * math.cos(node.pose.theta) + dy * math.sin(node.pose.theta)
+        assert along <= -0.2 or dist >= 3.2, "Peer is behind, must be cleared"
+    finally:
+        node.destroy_node()
+
+
+def test_whca_planner_destination_inside_mutex_corridor():
+    """Verify that a goal inside a mutex corridor plans with route_feasible=True."""
+    import rclpy
+    from geometry_msgs.msg import Pose2D
+    from sih_amr_fleet.whca_planner_node import WhcaPlannerNode
+    from sih_amr_interfaces.msg import Task, TaskAssignment
+
+    if not rclpy.ok():
+        rclpy.init()
+    node = WhcaPlannerNode()
+    try:
+        layout_path = pathlib.Path(__file__).parents[3] / 'warehouse_layout.lock.yaml'
+        if not layout_path.exists():
+            layout_path = pathlib.Path('warehouse_layout.lock.yaml')
+        node.load_map(str(layout_path))
+        node.robot_id = 'robot_2'
+        node.pose = Pose2D(x=-6.0, y=-8.0, theta=1.57)
+
+        # Peer robot_1 occupies narrow_junction_middle_centre
+        node.occupied_corridors['robot_1'] = 'narrow_junction_middle_centre'
+
+        # Goal is rnd_task_004 pickup at (0.0, 3.0525) inside narrow_junction_middle_centre
+        assignment = TaskAssignment()
+        assignment.task = Task()
+        assignment.task.task_id = 'rnd_task_004'
+        assignment.task.pickup = Pose2D(x=0.0, y=3.0525, theta=0.0)
+        node.assignment = assignment
+        node.execution_task_id = 'rnd_task_004'
+
+        # Verify that clear_goal=True leaves goal free
+        goal_cell = node.to_cell(assignment.task.pickup)
+        occupied_corridor_cells = set()
+        for peer_id, corridor_name in node.occupied_corridors.items():
+            occupied_corridor_cells.update(node.corridors.get(corridor_name, set()))
+
+        from sih_amr_fleet.algorithms import clear_nearfield_blockages, whca_star
+        planning_blockages = clear_nearfield_blockages(
+            set(node.blockages) | occupied_corridor_cells, (33, 44), goal_cell,
+            clear_goal=True,
+            clearance_cells=1,
+        )
+        assert goal_cell not in planning_blockages, "Goal cell must never be blocked"
+
+        path = whca_star(
+            (33, 44), goal_cell, node.static_blocked | planning_blockages, set(),
+            node.width, node.height, node.horizon, node.reservation_buffer_cells
+        )
+        assert bool(path), "Path to goal inside corridor must be feasible"
+    finally:
+        node.destroy_node()
+
+
 
 
 

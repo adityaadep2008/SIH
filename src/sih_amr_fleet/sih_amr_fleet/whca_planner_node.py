@@ -288,7 +288,7 @@ class WhcaPlannerNode(Node):
 
         planning_blockages = clear_nearfield_blockages(
             set(self.blockages) | occupied_corridor_cells, start, goal,
-            clear_goal=False if goal in occupied_corridor_cells else True,
+            clear_goal=True,
             clearance_cells=1,
         )
 
