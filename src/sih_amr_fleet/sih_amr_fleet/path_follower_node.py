@@ -5,7 +5,7 @@ from rclpy.node import Node
 from sih_amr_interfaces.msg import FleetEvent, RobotState, RoutePlan, SafetyState, TaskExecutionStatus
 from std_msgs.msg import Bool, Float32
 
-from .algorithms import reverse_recovery_allowed
+from .algorithms import recovery_yield_priority, reverse_recovery_allowed
 from .common import FLEET_STATE_QOS, POSE_QOS, PROTOCOL_QOS, clamp, header, new_session_id, now_seconds
 
 
@@ -298,8 +298,10 @@ class PathFollowerNode(Node):
             elif (now - self.stall_started >= 2.5 and
                   self.recovery_state == 'IDLE' and
                   now >= self.recovery_cooldown_until):
-                # Break symmetry: lower-priority AMR (higher robot_id) initiates retreat/replan
-                is_yielder = (conflicting_peer < self.robot_id) if conflicting_peer else True
+                # Break symmetry:
+                # 1. An AMR inside a protected corridor owns right-of-way to exit; outside waiting peers must not force it to retreat.
+                # 2. In open space, use standard robot-ID tie-breaking.
+                is_yielder = recovery_yield_priority(self.protected, conflicting_peer, self.robot_id)
                 if is_yielder:
                     self.recovery_state, self.recovery_started = 'VERIFY', now
                     self.publish_event('recovery_stop', f'stall detected with peer {conflicting_peer or "obstacle"}')

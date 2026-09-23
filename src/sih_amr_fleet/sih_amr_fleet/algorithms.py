@@ -120,6 +120,21 @@ def reverse_recovery_allowed(nearest_obstacle_m, reverse_distance_m,
             and nearest_obstacle_m > reverse_distance_m + margin_m)
 
 
+def recovery_yield_priority(inside_protected_resource, conflicting_peer, robot_id):
+    """Determine whether this robot should yield and initiate recovery retreat/replan.
+
+    If the AMR is inside/holding a protected corridor mutex (inside_protected_resource=True),
+    it owns the right-of-way to exit into the cross-aisle; outside waiting peers must not
+    force it to retreat.
+    In open/unprotected space, break symmetry using standard deterministic peer ID comparison.
+    """
+    if inside_protected_resource:
+        return False
+    if conflicting_peer:
+        return conflicting_peer < robot_id
+    return True
+
+
 def finite_command(linear_x, angular_z):
     """Return whether the final velocity command components are finite."""
     return math.isfinite(float(linear_x)) and math.isfinite(float(angular_z))

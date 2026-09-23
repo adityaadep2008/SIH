@@ -10,8 +10,8 @@ from sih_amr_fleet.algorithms import (
     filter_unexpected_blockages, finite_command, float32_wire_value,
     freeze_auction_value, lane_waypoint_overrides,
     map_transform_for_anchor,
-    local_point_to_grid_cell, reverse_recovery_allowed, sensor_point_to_base,
-    static_grid_path_distance, whca_star,
+    local_point_to_grid_cell, recovery_yield_priority, reverse_recovery_allowed,
+    sensor_point_to_base, static_grid_path_distance, whca_star,
 )
 from sih_amr_fleet.map_geometry import map_geometry_from_data
 from sih_amr_fleet.warehouse_tasks import Lane, aisle_points, narrow_lanes
@@ -416,6 +416,21 @@ def test_recovery_reverse_rejects_obstructed_retreat_allows_protected_when_clear
     assert reverse_recovery_allowed(5.0, 2.0, 0.5, True, False)
     # When in final docking (dock_claimed=True), retreat is rejected to preserve docking alignment
     assert not reverse_recovery_allowed(5.0, 2.0, 0.5, False, True)
+
+
+def test_recovery_yield_priority_protects_corridor_owner_and_breaks_open_space_symmetry():
+    # Protected corridor owner NEVER yields to outside peers (even if peer ID is smaller, e.g. robot_3 vs robot_4)
+    assert not recovery_yield_priority(inside_protected_resource=True, conflicting_peer='robot_3', robot_id='robot_4')
+    assert not recovery_yield_priority(inside_protected_resource=True, conflicting_peer='robot_1', robot_id='robot_4')
+    assert not recovery_yield_priority(inside_protected_resource=True, conflicting_peer=None, robot_id='robot_4')
+
+    # Unprotected / open-space robots break symmetry deterministically:
+    # Lower-priority robot (robot_4 > robot_3) yields to robot_3
+    assert recovery_yield_priority(inside_protected_resource=False, conflicting_peer='robot_3', robot_id='robot_4')
+    # Higher-priority robot (robot_1 < robot_2) does NOT yield to robot_2
+    assert not recovery_yield_priority(inside_protected_resource=False, conflicting_peer='robot_2', robot_id='robot_1')
+    # If no conflicting peer specified in open space, defaults to yielding to clear obstacle
+    assert recovery_yield_priority(inside_protected_resource=False, conflicting_peer=None, robot_id='robot_1')
 
 
 def test_map_declares_dock_resources_and_strip_references():
