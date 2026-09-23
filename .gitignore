@@ -12,6 +12,9 @@ CODEX_VALIDATION_HANDOFF.yaml
 antigravity_handoff.md
 analysisguide.md
 problem.md
-collected_datasets_combined.csv
+collected_datasets_*.csv
+frontend/*.csv
+frontend/collected_datasets_*.csv
 .codex/
+
 
