@@ -1,3 +1,4 @@
+import json
 import math
 import pathlib
 import re
@@ -705,6 +706,32 @@ def test_cyclone_config_allows_the_full_fleet_participant_graph():
     config = pathlib.Path(__file__).parents[1].joinpath('config/cyclonedds.xml').read_text()
     match = re.search(r'<MaxAutoParticipantIndex>(\d+)</MaxAutoParticipantIndex>', config)
     assert match is not None and int(match.group(1)) >= 119
+
+
+def test_zenoh_session_config_and_launcher_support():
+    config_file = pathlib.Path(__file__).parents[1].joinpath('config/zenoh_session_config.json5')
+    assert config_file.is_file(), "zenoh_session_config.json5 must exist"
+    content = config_file.read_text()
+    # Strip comments to parse JSON
+    lines = [line for line in content.splitlines() if not line.strip().startswith('//')]
+    data = json.loads('\n'.join(lines))
+    assert data.get('mode') == 'peer'
+    assert data.get('connect', {}).get('endpoints') == ['tcp/localhost:7447']
+    assert data.get('scouting', {}).get('multicast', {}).get('enabled') is False
+    assert data.get('transport', {}).get('shared_memory', {}).get('enabled') is False
+
+    repo_root = pathlib.Path(__file__).parents[3]
+    four_sh = repo_root.joinpath('scripts/launch_four_amrs.sh').read_text()
+    fleet_sh = repo_root.joinpath('scripts/launch_fleet_amrs.sh').read_text()
+    laptop_py = repo_root.joinpath('scripts/run_laptop_data_collection.py').read_text()
+    desktop_py = repo_root.joinpath('scripts/run_desktop_data_collection.py').read_text()
+
+    assert 'ZENOH_SESSION_CONFIG_URI' in four_sh
+    assert 'ZENOH_SESSION_CONFIG_URI' in fleet_sh
+    assert 'rmw_zenohd' in four_sh and 'ZENOHD_PID' in four_sh
+    assert 'rmw_zenohd' in fleet_sh and 'ZENOHD_PID' in fleet_sh
+    assert '--dds' in laptop_py and 'rmw_zenoh_cpp' in laptop_py
+    assert '--dds' in desktop_py and 'rmw_zenoh_cpp' in desktop_py
 
 
 def test_controller_contract_is_stamped_and_bridge_rejects_nonfinite_commands():

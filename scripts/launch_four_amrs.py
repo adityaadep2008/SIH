@@ -23,6 +23,7 @@ WORLD_FILE = WAREHOUSE_DIR / "worlds" / "small_warehouse" / "warehouse_clean.sdf
 GUI_CONFIG = Path("/opt/ros/jazzy/opt/gz_sim_vendor/share/gz/gz-sim8/gui/gui.config")
 CONTROL_CONFIG = SIH_ROOT / "src" / "sih_amr_fleet" / "config" / "fleet_fast_control.yaml"
 CYCLONEDDS_XML = SIH_ROOT / "src" / "sih_amr_fleet" / "config" / "cyclonedds.xml"
+ZENOH_CONFIG = SIH_ROOT / "src" / "sih_amr_fleet" / "config" / "zenoh_session_config.json5"
 LOG_BASE_DIR = WORKSPACE / "log" / "four_amr_runs"
 
 # Default charging pad spawn poses (South wall charging bay, facing North +Y / yaw = 1.5708)
@@ -43,9 +44,19 @@ def setup_environment():
     env = os.environ.copy()
     env["ROS_DOMAIN_ID"] = env.get("ROS_DOMAIN_ID", "42")
     env["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
-    env["RMW_IMPLEMENTATION"] = env.get("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
-    if CYCLONEDDS_XML.exists():
-        env["CYCLONEDDS_URI"] = f"file://{CYCLONEDDS_XML}"
+    rmw = env.get("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
+    env["RMW_IMPLEMENTATION"] = rmw
+    if rmw.startswith("rmw_zenoh"):
+        env.pop("CYCLONEDDS_URI", None)
+        if ZENOH_CONFIG.exists():
+            env["ZENOH_SESSION_CONFIG_URI"] = str(ZENOH_CONFIG)
+    elif rmw.startswith("rmw_fastrtps"):
+        env.pop("CYCLONEDDS_URI", None)
+        env.pop("ZENOH_SESSION_CONFIG_URI", None)
+    else:
+        env.pop("ZENOH_SESSION_CONFIG_URI", None)
+        if CYCLONEDDS_XML.exists():
+            env["CYCLONEDDS_URI"] = f"file://{CYCLONEDDS_XML}"
     env["GZ_IP"] = "127.0.0.1"
     env["QT_QPA_PLATFORM"] = "xcb"
     
@@ -113,14 +124,14 @@ def cleanup_lingering_processes():
     """Clean up any old simulation or AMR processes from prior aborted runs."""
     try:
         subprocess.run(
-            ["pkill", "-15", "-f", "gz sim|ros_gz_bridge|spawn_minimal_amr|diffdrive_spawner"],
+            ["pkill", "-15", "-f", "gz sim|ros_gz_bridge|spawn_minimal_amr|diffdrive_spawner|rmw_zenohd"],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         time.sleep(0.5)
         subprocess.run(
-            ["pkill", "-9", "-f", "gz sim|ros_gz_bridge|spawn_minimal_amr|diffdrive_spawner"],
+            ["pkill", "-9", "-f", "gz sim|ros_gz_bridge|spawn_minimal_amr|diffdrive_spawner|rmw_zenohd"],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -284,6 +295,13 @@ def main():
 
     # 1. Clean lingering processes
     cleanup_lingering_processes()
+
+    # 1b. Start Zenoh Router Daemon if rmw_zenoh_cpp
+    if ENV.get("RMW_IMPLEMENTATION", "").startswith("rmw_zenoh"):
+        print("Starting Zenoh Router Daemon (rmw_zenohd)...")
+        zenohd_cmd = ["ros2", "run", "rmw_zenoh_cpp", "rmw_zenohd"]
+        start_process(zenohd_cmd, log_dir / "rmw_zenohd.log", "Zenoh Router")
+        time.sleep(1.0)
 
     # 2. Start Gazebo Server
     print("Starting Gazebo Server...")

@@ -64,7 +64,7 @@ def detect_active_ros_environment() -> Dict[str, str]:
                         for item in env_data:
                             try:
                                 key, val = item.decode("utf-8").split("=", 1)
-                                if key in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "CYCLONEDDS_URI", "ROS_AUTOMATIC_DISCOVERY_RANGE"):
+                                if key in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "CYCLONEDDS_URI", "ROS_AUTOMATIC_DISCOVERY_RANGE", "ZENOH_SESSION_CONFIG_URI"):
                                     env_vars[key] = val
                             except ValueError:
                                 pass
@@ -92,15 +92,24 @@ if "RMW_IMPLEMENTATION" in detected_env and os.environ.get("RMW_IMPLEMENTATION")
 if "CYCLONEDDS_URI" in detected_env and os.environ.get("CYCLONEDDS_URI") != detected_env["CYCLONEDDS_URI"]:
     os.environ["CYCLONEDDS_URI"] = detected_env["CYCLONEDDS_URI"]
     need_reexec = True
+if "ZENOH_SESSION_CONFIG_URI" in detected_env and os.environ.get("ZENOH_SESSION_CONFIG_URI") != detected_env["ZENOH_SESSION_CONFIG_URI"]:
+    os.environ["ZENOH_SESSION_CONFIG_URI"] = detected_env["ZENOH_SESSION_CONFIG_URI"]
+    need_reexec = True
 if "ROS_AUTOMATIC_DISCOVERY_RANGE" in detected_env:
     os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = detected_env["ROS_AUTOMATIC_DISCOVERY_RANGE"]
 
-# Ensure default single-machine baseline CycloneDDS config is applied if not explicit
-cyclone_xml = Path("/home/rtsws/amr_ws/src/SIH/src/sih_amr_fleet/config/cyclonedds.xml")
-if cyclone_xml.exists() and "CYCLONEDDS_URI" not in os.environ:
-    os.environ["CYCLONEDDS_URI"] = f"file://{cyclone_xml}"
-    os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
-    os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
+zenoh_json5 = Path("/home/rtsws/amr_ws/src/SIH/src/sih_amr_fleet/config/zenoh_session_config.json5")
+if os.environ.get("RMW_IMPLEMENTATION", "").startswith("rmw_zenoh"):
+    if zenoh_json5.exists() and "ZENOH_SESSION_CONFIG_URI" not in os.environ:
+        os.environ["ZENOH_SESSION_CONFIG_URI"] = str(zenoh_json5)
+        os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
+else:
+    # Ensure default single-machine baseline CycloneDDS config is applied if not explicit
+    cyclone_xml = Path("/home/rtsws/amr_ws/src/SIH/src/sih_amr_fleet/config/cyclonedds.xml")
+    if cyclone_xml.exists() and "CYCLONEDDS_URI" not in os.environ:
+        os.environ["CYCLONEDDS_URI"] = f"file://{cyclone_xml}"
+        os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+        os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
 
 interfaces_lib = str(WORKSPACE_INSTALL / "sih_amr_interfaces" / "lib")
 current_ld = os.environ.get("LD_LIBRARY_PATH", "")

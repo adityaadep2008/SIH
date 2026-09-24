@@ -64,7 +64,11 @@ export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 # inherit an unrelated shell-wide RMW selection; comparison runs opt in with
 # the project-specific SIH_RMW_IMPLEMENTATION variable.
 export RMW_IMPLEMENTATION="${SIH_RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
-if [[ "$RMW_IMPLEMENTATION" == rmw_fastrtps* ]]; then
+if [[ "$RMW_IMPLEMENTATION" == rmw_zenoh* ]]; then
+  unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_BUILTIN_TRANSPORTS RMW_FASTRTPS_PUBLICATION_MODE CYCLONEDDS_URI
+  export ZENOH_SESSION_CONFIG_URI="${SIH_ZENOH_CONFIG:-$SIH_ROOT/src/sih_amr_fleet/config/zenoh_session_config.json5}"
+elif [[ "$RMW_IMPLEMENTATION" == rmw_fastrtps* ]]; then
+  unset CYCLONEDDS_URI ZENOH_SESSION_CONFIG_URI
   export RMW_FASTRTPS_PUBLICATION_MODE="${RMW_FASTRTPS_PUBLICATION_MODE:-SYNCHRONOUS}"
   if [[ -n "${SIH_FASTDDS_PROFILE:-}" ]]; then
     export FASTRTPS_DEFAULT_PROFILES_FILE="$SIH_FASTDDS_PROFILE"
@@ -73,7 +77,7 @@ if [[ "$RMW_IMPLEMENTATION" == rmw_fastrtps* ]]; then
     export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
   fi
 else
-  unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_BUILTIN_TRANSPORTS RMW_FASTRTPS_PUBLICATION_MODE
+  unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_BUILTIN_TRANSPORTS RMW_FASTRTPS_PUBLICATION_MODE ZENOH_SESSION_CONFIG_URI
   export CYCLONEDDS_URI="${SIH_CYCLONEDDS_URI:-file://$SIH_ROOT/src/sih_amr_fleet/config/cyclonedds.xml}"
 fi
 write_run_event middleware_selected "$RMW_IMPLEMENTATION"
@@ -82,8 +86,18 @@ export QT_QPA_PLATFORM=xcb
 export GZ_SIM_SYSTEM_PLUGIN_PATH="/opt/ros/jazzy/lib${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
 export GZ_SIM_RESOURCE_PATH="$SIH_ROOT/src/sih_amr_fleet/models:$WAREHOUSE_DIR/models:$WAREHOUSE_DIR:/opt/ros/jazzy/share"
 
-SERVER_PID="" CLOCK_PID="" GUI_PID="" FLEET_PID="" DATA_PID="" STARTED_PID=""
+SERVER_PID="" CLOCK_PID="" GUI_PID="" FLEET_PID="" DATA_PID="" STARTED_PID="" ZENOHD_PID=""
 declare -a ROBOT_PIDS=() CHARGING_PIDS=()
+
+# Start Zenoh router daemon if running rmw_zenoh_cpp and no router is active
+if [[ "$RMW_IMPLEMENTATION" == rmw_zenoh* ]]; then
+  if ! pgrep -f "rmw_zenohd" >/dev/null 2>&1; then
+    ros2 run rmw_zenoh_cpp rmw_zenohd > "$LOG_DIR/rmw_zenohd.log" 2>&1 &
+    ZENOHD_PID=$!
+    write_run_event zenoh_router_started "pid=$ZENOHD_PID"
+    sleep 0.5
+  fi
+fi
 
 start_group() {
   local log_file="$1"
@@ -97,7 +111,7 @@ cleanup() {
   trap - EXIT INT TERM
   write_run_event launcher_exiting "status=$status"
   echo 'Stopping this four-AMR run...'
-  for pid in "$GUI_PID" "$FLEET_PID" "$DATA_PID" "${CHARGING_PIDS[@]}" "${ROBOT_PIDS[@]}" "$CLOCK_PID" "$SERVER_PID"; do
+  for pid in "$GUI_PID" "$FLEET_PID" "$DATA_PID" "${CHARGING_PIDS[@]}" "${ROBOT_PIDS[@]}" "$CLOCK_PID" "$SERVER_PID" "$ZENOHD_PID"; do
     # start_group creates a dedicated session.  Signal both its leader and
     # its process group: `timeout` can otherwise interrupt this wrapper while
     # a ROS launch has already re-parented its children, leaving a stale AMR
@@ -107,13 +121,13 @@ cleanup() {
   done
   for _ in $(seq 1 15); do
     local alive=false
-    for pid in "$GUI_PID" "$FLEET_PID" "$DATA_PID" "${CHARGING_PIDS[@]}" "${ROBOT_PIDS[@]}" "$CLOCK_PID" "$SERVER_PID"; do
+    for pid in "$GUI_PID" "$FLEET_PID" "$DATA_PID" "${CHARGING_PIDS[@]}" "${ROBOT_PIDS[@]}" "$CLOCK_PID" "$SERVER_PID" "$ZENOHD_PID"; do
       [[ -n "$pid" ]] && kill -0 -- "-$pid" 2>/dev/null && alive=true
     done
     [[ "$alive" == false ]] && break
     sleep 1
   done
-  for pid in "$GUI_PID" "$FLEET_PID" "$DATA_PID" "${CHARGING_PIDS[@]}" "${ROBOT_PIDS[@]}" "$CLOCK_PID" "$SERVER_PID"; do
+  for pid in "$GUI_PID" "$FLEET_PID" "$DATA_PID" "${CHARGING_PIDS[@]}" "${ROBOT_PIDS[@]}" "$CLOCK_PID" "$SERVER_PID" "$ZENOHD_PID"; do
     [[ -n "$pid" ]] && kill -KILL "$pid" 2>/dev/null || true
     [[ -n "$pid" ]] && kill -KILL -- "-$pid" 2>/dev/null || true
   done

@@ -113,7 +113,8 @@ class LaptopCycleRun:
         base_dir: Path,
         timeout_s: int,
         fleet_count: int = 4,
-        gui: bool = False
+        gui: bool = False,
+        use_dds: bool = False
     ):
         self.run_index = run_index
         self.total_runs = total_runs
@@ -122,6 +123,7 @@ class LaptopCycleRun:
         self.timeout_s = timeout_s
         self.fleet_count = fleet_count
         self.gui = gui
+        self.use_dds = use_dds
         self.run_id = f"laptop_run_{run_index:03d}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.log_dir = base_dir / self.run_id
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -148,7 +150,7 @@ class LaptopCycleRun:
             "twist_stamper", "localization_node", "interface_readiness",
             "robot_state_publisher", "static_transform_publisher", "diffdrive_spawner",
             "dashboard_bridge_node", "dashboard_bridge", "kinematic_carrier_node",
-            "kinematic_carrier", "verify_gazebo_pose"
+            "kinematic_carrier", "verify_gazebo_pose", "rmw_zenohd"
         ]
         for pat in patterns:
             try:
@@ -374,6 +376,14 @@ class LaptopCycleRun:
         env["ROS_DOMAIN_ID"] = str(run_domain_id)
         env["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
 
+        # Middleware selection: Default to Zenoh unless --dds is explicitly requested
+        if self.use_dds:
+            env["SIH_RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+            mw_desc = "Cyclone DDS (rmw_cyclonedds_cpp)"
+        else:
+            env["SIH_RMW_IMPLEMENTATION"] = "rmw_zenoh_cpp"
+            mw_desc = "Eclipse Zenoh (rmw_zenoh_cpp)"
+
         script_dir = Path(__file__).resolve().parent
         launch_script = script_dir / "launch_fleet_amrs.sh"
         if not launch_script.exists():
@@ -383,7 +393,8 @@ class LaptopCycleRun:
         print(f"\n{C_BG_BLUE}{C_WHITE}{C_BOLD} >>> STARTING LAPTOP TEST RUN {self.run_index}/{self.total_runs}: {self.run_id} <<<{C_RESET}")
         print(f" {C_CYAN}Target Work Cycle:{C_RESET} {self.target_tasks} completed tasks across {self.fleet_count} AMRs")
         print(f" {C_CYAN}Log Directory:{C_RESET}     {self.log_dir}")
-        print(f" {C_CYAN}DDS Domain ID:{C_RESET}     {run_domain_id} (Range [60, 99]) | Seed: {seed + self.run_index}")
+        print(f" {C_CYAN}Middleware:{C_RESET}        {mw_desc}")
+        print(f" {C_CYAN}Domain ID:{C_RESET}         {run_domain_id} (Range [60, 99]) | Seed: {seed + self.run_index}")
         print(f" {C_CYAN}Fleet Architecture:{C_RESET}Consolidated Agent Processes, 50 Hz Physics, Lean Telemetry\n")
         sys.stdout.flush()
 
@@ -508,6 +519,7 @@ def main():
     parser.add_argument("--seed", type=int, default=2000, help="Base random seed for Laptop")
     parser.add_argument("--timeout", type=int, default=3600, help="Per-run timeout seconds")
     parser.add_argument("--gui", action="store_true", default=False, help="Launch Gazebo with GUI enabled (default: headless)")
+    parser.add_argument("-dds", "--dds", action="store_true", default=False, help="Use DDS (Cyclone DDS) instead of default Zenoh (rmw_zenoh_cpp)")
     repo_root = Path(__file__).resolve().parent.parent
     parser.add_argument("-d", "--compile-dataset", action="store_true", help="Rebuild the complete laptop dataset from all saved laptop telemetry after the run")
     parser.add_argument("-o", "--output-csv", default=str(repo_root / "collected_datasets_laptop.csv"), help="Dataset output path used with -d")
@@ -517,9 +529,11 @@ def main():
     base_dir = log_root / f"laptop_data_collection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     base_dir.mkdir(parents=True, exist_ok=True)
 
+    mw_mode = "Cyclone DDS (rmw_cyclonedds_cpp)" if args.dds else "Eclipse Zenoh (rmw_zenoh_cpp)"
     print(f"\n{C_BOLD}{C_GREEN}======================================================================{C_RESET}")
     print(f"{C_BOLD}{C_GREEN}  SIH LAPTOP AUTOMATED DATA COLLECTION: {args.fleet_size} AMRs, {args.runs} RUN(S) × {args.tasks} TASKS  {C_RESET}")
     print(f"{C_BOLD}{C_GREEN}  TARGET: {args.runs * args.tasks} DATASET TASKS @ {args.speed} m/s FOR ML CONGESTION MODEL  {C_RESET}")
+    print(f"{C_BOLD}{C_GREEN}  MIDDLEWARE: {mw_mode}  {C_RESET}")
     print(f"{C_BOLD}{C_GREEN}======================================================================{C_RESET}\n")
 
     telemetry_files = []
@@ -529,7 +543,7 @@ def main():
         for idx in range(1, args.runs + 1):
             run = LaptopCycleRun(
                 idx, args.runs, args.tasks, base_dir, args.timeout,
-                fleet_count=args.fleet_size, gui=args.gui
+                fleet_count=args.fleet_size, gui=args.gui, use_dds=args.dds
             )
             success = run.execute(tracking_speed=args.speed, settle_s=3, seed=args.seed)
             if run.telemetry_file.exists() and run.telemetry_file.stat().st_size > 0:

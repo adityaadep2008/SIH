@@ -1,0 +1,63 @@
+// ROS 2 Jazzy rmw_zenoh_cpp session configuration for SIH Multi-AMR Fleet
+// Uses pure localhost router client/peer topology to eliminate discovery storms.
+{
+  "mode": "peer",
+  "connect": {
+    "timeout_ms": {
+      "router": -1,
+      "peer": -1,
+      "client": 0
+    },
+    "endpoints": [
+      "tcp/localhost:7447"
+    ]
+  },
+  "listen": {
+    "timeout_ms": 0,
+    "endpoints": [
+      "tcp/localhost:0"
+    ]
+  },
+  "scouting": {
+    "multicast": {
+      "enabled": false
+    },
+    "gossip": {
+      "enabled": true,
+      "multihop": false,
+      "target": {
+        "router": ["router", "peer"],
+        "peer": ["router"]
+      },
+      "autoconnect": {
+        "router": ["router", "peer"],
+        "peer": ["router", "peer"]
+      },
+      "autoconnect_strategy": {
+        "peer": {
+          "to_router": "always",
+          "to_peer": "greater-zid"
+        }
+      }
+    }
+  },
+  "timestamping": {
+    "enabled": {
+      "router": true,
+      "peer": true,
+      "client": true
+    }
+  },
+  "transport": {
+    "unicast": {
+      "max_links": 64,
+      "lowlatency": false,
+      "qos": {
+        "enabled": true
+      }
+    },
+    "shared_memory": {
+      "enabled": false
+    }
+  }
+}
