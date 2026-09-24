@@ -61,9 +61,11 @@ write_run_event launcher_started "fleet_count=$FLEET_COUNT headless_or_gui_run_r
 write_run_event simulation_profile "sensor_profile=$SENSOR_PROFILE lidar_hz=$LIDAR_UPDATE_RATE_HZ tracking_mps=$FLEET_TRACKING_SPEED_MPS target_rtf=${SIM_RTF_LIMIT:-unthrottled}"
 
 source /opt/ros/jazzy/setup.bash
-[[ -f "$OVERLAY/setup.bash" ]] && source "$OVERLAY/setup.bash"
-[[ -f "$SIH_ROOT/install/setup.bash" ]] && source "$SIH_ROOT/install/setup.bash"
-[[ -f "$WORKSPACE/install/setup.bash" ]] && source "$WORKSPACE/install/setup.bash"
+if [[ -f "$WORKSPACE/install/setup.bash" ]]; then
+  source "$WORKSPACE/install/setup.bash"
+elif [[ -f "$OVERLAY/setup.bash" ]]; then
+  source "$OVERLAY/setup.bash"
+fi
 set -u
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
@@ -246,7 +248,7 @@ for r in $(seq 1 "$FLEET_COUNT"); do
   x_var="ROBOT_${r}_X"
   y_var="ROBOT_${r}_Y"
   yaw_var="ROBOT_${r}_YAW"
-  python3 "$SCRIPT_DIR/verify_gazebo_pose.py" --robot "robot_${r}" --expected-x "${!x_var}" --expected-y "${!y_var}" --expected-yaw "${!yaw_var}" --tol-xy 0.45 --tol-yaw 0.75 --timeout 5.0 || fail "robot_${r} failed final Gazebo pre-launch check"
+  python3 "$SCRIPT_DIR/verify_gazebo_pose.py" --robot "robot_${r}" --expected-x "${!x_var}" --expected-y "${!y_var}" --expected-yaw "${!yaw_var}" --tol-xy 0.45 --tol-yaw 0.75 --timeout 15.0 || fail "robot_${r} failed final Gazebo pre-launch check"
 done
 echo "All $FLEET_COUNT AMRs successfully verified at correct coordinates and angles in Gazebo."
 

@@ -44,7 +44,7 @@ def query_gz_model_cli(robot_name):
         try:
             res = subprocess.run(
                 ["gz", "model", "-m", model_name, "-p"],
-                capture_output=True, text=True, timeout=2.0
+                capture_output=True, text=True, timeout=1.5
             )
             if res.returncode == 0 and res.stdout:
                 m = re.search(
@@ -118,8 +118,8 @@ def main():
         # Try transport sample first
         pose_sample = latest_pose if (found_event and latest_pose) else None
 
-        # If no transport sample yet, try CLI query
-        if pose_sample is None:
+        # Give gz_transport a brief grace period (0.6s) to receive streaming packets before blocking on CLI queries
+        if pose_sample is None and (time.time() - start_t) > 0.6:
             cli_sample = query_gz_model_cli(args.robot)
             if cli_sample:
                 pose_sample = cli_sample
@@ -149,7 +149,7 @@ def main():
                 sys.stdout.flush()
                 return 0
 
-        time.sleep(0.2)
+        time.sleep(0.05)
 
     if latest_pose:
         cur_x = latest_pose["x"]
