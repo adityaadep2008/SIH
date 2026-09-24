@@ -1,0 +1,41 @@
+{
+  "mode": "peer",
+  "transport": {
+    "unicast": {
+      "max_links": 64
+    },
+    "shared_memory": {
+      "enabled": false
+    }
+  },
+  "scouting": {
+    "delay": 200,
+    "multicast": {
+      "enabled": true,
+      "autoconnect": {
+        "router": ["router", "peer"],
+        "peer": ["router", "peer"]
+      }
+    },
+    "gossip": {
+      "enabled": true,
+      "autoconnect": {
+        "router": ["router", "peer"],
+        "peer": ["router", "peer"]
+      }
+    }
+  },
+  "connect": {
+    "timeout_ms": { "router": 500, "peer": 500, "client": 0 },
+    "endpoints": [
+      "tcp/127.0.0.1:7447"
+    ]
+  },
+  "listen": {
+    "endpoints": [
+      "tcp/0.0.0.0:0",
+      "udp/0.0.0.0:0"
+    ]
+  }
+}
+

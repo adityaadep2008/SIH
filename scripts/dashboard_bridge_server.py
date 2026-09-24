@@ -95,12 +95,13 @@ if "CYCLONEDDS_URI" in detected_env and os.environ.get("CYCLONEDDS_URI") != dete
 if "ROS_AUTOMATIC_DISCOVERY_RANGE" in detected_env:
     os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = detected_env["ROS_AUTOMATIC_DISCOVERY_RANGE"]
 
-# Ensure default single-machine baseline CycloneDDS config is applied if not explicit
-cyclone_xml = Path("/home/rtsws/amr_ws/src/SIH/src/sih_amr_fleet/config/cyclonedds.xml")
-if cyclone_xml.exists() and "CYCLONEDDS_URI" not in os.environ:
-    os.environ["CYCLONEDDS_URI"] = f"file://{cyclone_xml}"
-    os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
-    os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
+# Ensure default Zenoh peer mesh config is applied if not explicit
+zenoh_json = Path("/home/rtsws/amr_ws/src/SIH/src/sih_amr_fleet/config/zenoh_mesh_peer.json5")
+if zenoh_json.exists() and "ZENOH_CONFIG_FILE" not in os.environ:
+    os.environ["ZENOH_CONFIG_FILE"] = str(zenoh_json)
+    os.environ["ZENOH_ROUTER_MODE"] = "peer"
+    os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_zenoh_cpp")
+    os.environ.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "ALL")
 
 interfaces_lib = str(WORKSPACE_INSTALL / "sih_amr_interfaces" / "lib")
 current_ld = os.environ.get("LD_LIBRARY_PATH", "")

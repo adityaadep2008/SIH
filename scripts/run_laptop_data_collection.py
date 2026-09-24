@@ -148,7 +148,7 @@ class LaptopCycleRun:
             "twist_stamper", "localization_node", "interface_readiness",
             "robot_state_publisher", "static_transform_publisher", "diffdrive_spawner",
             "dashboard_bridge_node", "dashboard_bridge", "kinematic_carrier_node",
-            "kinematic_carrier", "verify_gazebo_pose"
+            "kinematic_carrier", "verify_gazebo_pose", "rmw_zenohd", "zenoh"
         ]
         for pat in patterns:
             try:

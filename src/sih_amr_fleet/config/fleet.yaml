@@ -10,7 +10,8 @@ coordination:
   health_heartbeat_hz: 2.0
 
 communication:
-  protocol: "DDS"
-  rmw_default: "rmw_cyclonedds_cpp"
+  protocol: "Zenoh_Peer_Mesh"
+  rmw_default: "rmw_zenoh_cpp"
+  config_file: "config/zenoh_mesh_peer.json5"
   domain_id: 42
-  discovery_range: "LOCALHOST"
+  discovery_range: "ALL"

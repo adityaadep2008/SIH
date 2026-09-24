@@ -21,8 +21,7 @@ WORKSPACE = SIH_ROOT.parent.parent
 WAREHOUSE_DIR = WORKSPACE / "src" / "warehouse_world_custom"
 WORLD_FILE = WAREHOUSE_DIR / "worlds" / "small_warehouse" / "warehouse_clean.sdf"
 GUI_CONFIG = Path("/opt/ros/jazzy/opt/gz_sim_vendor/share/gz/gz-sim8/gui/gui.config")
-CONTROL_CONFIG = SIH_ROOT / "src" / "sih_amr_fleet" / "config" / "fleet_fast_control.yaml"
-CYCLONEDDS_XML = SIH_ROOT / "src" / "sih_amr_fleet" / "config" / "cyclonedds.xml"
+ZENOH_CONFIG = SIH_ROOT / "src" / "sih_amr_fleet" / "config" / "zenoh_mesh_peer.json5"
 LOG_BASE_DIR = WORKSPACE / "log" / "four_amr_runs"
 
 # Default charging pad spawn poses (South wall charging bay, facing North +Y / yaw = 1.5708)
@@ -42,10 +41,11 @@ def setup_environment():
     """Prepare environment variables for Gazebo and ROS 2 Jazzy."""
     env = os.environ.copy()
     env["ROS_DOMAIN_ID"] = env.get("ROS_DOMAIN_ID", "42")
-    env["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
-    env["RMW_IMPLEMENTATION"] = env.get("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
-    if CYCLONEDDS_XML.exists():
-        env["CYCLONEDDS_URI"] = f"file://{CYCLONEDDS_XML}"
+    env["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "ALL"
+    env["RMW_IMPLEMENTATION"] = env.get("RMW_IMPLEMENTATION", "rmw_zenoh_cpp")
+    if ZENOH_CONFIG.exists():
+        env["ZENOH_CONFIG_FILE"] = str(ZENOH_CONFIG)
+        env["ZENOH_ROUTER_MODE"] = "peer"
     env["GZ_IP"] = "127.0.0.1"
     env["QT_QPA_PLATFORM"] = "xcb"
     

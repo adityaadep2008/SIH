@@ -691,19 +691,22 @@ def test_simulation_time_and_tracking_speed_are_launch_configurable():
     assert 'sensor_profile:="$SENSOR_PROFILE"' in launcher
 
 
-def test_four_amr_launcher_defaults_to_cyclone_and_keeps_fastdds_override_safe():
+def test_four_amr_launcher_defaults_to_zenoh_and_keeps_fastdds_override_safe():
     launcher = pathlib.Path(__file__).parents[3].joinpath('scripts/launch_four_amrs.sh').read_text()
-    assert 'RMW_IMPLEMENTATION="${SIH_RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"' in launcher
-    assert 'CYCLONEDDS_URI="${SIH_CYCLONEDDS_URI:-file://$SIH_ROOT/src/sih_amr_fleet/config/cyclonedds.xml}"' in launcher
+    assert 'RMW_IMPLEMENTATION="${SIH_RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"' in launcher
+    assert 'ZENOH_CONFIG_FILE="${SIH_ZENOH_CONFIG:-$SIH_ROOT/src/sih_amr_fleet/config/zenoh_mesh_peer.json5}"' in launcher
     assert 'if [[ "$RMW_IMPLEMENTATION" == rmw_fastrtps* ]]' in launcher
     assert 'export FASTDDS_BUILTIN_TRANSPORTS=UDPv4' in launcher
     assert 'kill -TERM "$pid"' in launcher
 
 
-def test_cyclone_config_allows_the_full_fleet_participant_graph():
-    config = pathlib.Path(__file__).parents[1].joinpath('config/cyclonedds.xml').read_text()
-    match = re.search(r'<MaxAutoParticipantIndex>(\d+)</MaxAutoParticipantIndex>', config)
-    assert match is not None and int(match.group(1)) >= 119
+def test_zenoh_config_is_valid_peer_mesh_mode():
+    config_file = pathlib.Path(__file__).parents[1].joinpath('config/zenoh_mesh_peer.json5')
+    assert config_file.exists()
+    content = config_file.read_text()
+    assert '"mode": "peer"' in content
+    assert '"shared_memory"' in content
+    assert '"max_links": 64' in content
 
 
 def test_controller_contract_is_stamped_and_bridge_rejects_nonfinite_commands():

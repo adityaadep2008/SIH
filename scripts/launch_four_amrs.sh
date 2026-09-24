@@ -63,8 +63,11 @@ export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 # this host and is now the deterministic single-machine baseline.  Do not
 # inherit an unrelated shell-wide RMW selection; comparison runs opt in with
 # the project-specific SIH_RMW_IMPLEMENTATION variable.
-export RMW_IMPLEMENTATION="${SIH_RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
-if [[ "$RMW_IMPLEMENTATION" == rmw_fastrtps* ]]; then
+export RMW_IMPLEMENTATION="${SIH_RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
+if [[ "$RMW_IMPLEMENTATION" == rmw_zenoh* ]]; then
+  export ZENOH_CONFIG_FILE="${SIH_ZENOH_CONFIG:-$SIH_ROOT/src/sih_amr_fleet/config/zenoh_mesh_peer.json5}"
+  export ZENOH_ROUTER_MODE=peer
+elif [[ "$RMW_IMPLEMENTATION" == rmw_fastrtps* ]]; then
   export RMW_FASTRTPS_PUBLICATION_MODE="${RMW_FASTRTPS_PUBLICATION_MODE:-SYNCHRONOUS}"
   if [[ -n "${SIH_FASTDDS_PROFILE:-}" ]]; then
     export FASTRTPS_DEFAULT_PROFILES_FILE="$SIH_FASTDDS_PROFILE"
@@ -72,9 +75,6 @@ if [[ "$RMW_IMPLEMENTATION" == rmw_fastrtps* ]]; then
     unset FASTRTPS_DEFAULT_PROFILES_FILE
     export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
   fi
-else
-  unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_BUILTIN_TRANSPORTS RMW_FASTRTPS_PUBLICATION_MODE
-  export CYCLONEDDS_URI="${SIH_CYCLONEDDS_URI:-file://$SIH_ROOT/src/sih_amr_fleet/config/cyclonedds.xml}"
 fi
 write_run_event middleware_selected "$RMW_IMPLEMENTATION"
 export GZ_IP="${GZ_IP:-127.0.0.1}"
