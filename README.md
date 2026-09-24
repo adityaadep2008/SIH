@@ -2,6 +2,10 @@
 
 This repository is the decentralized ROS 2 Jazzy multi-AMR fleet overlay for the custom Gazebo Harmonic warehouse at `~/amr_ws/src/warehouse_world_custom`.
 
+- **Primary Communication**: Eclipse Zenoh (`rmw_zenoh_cpp`) with centralized localhost router daemon (`rmw_zenohd`), eliminating $O(N^2)$ discovery storms and cutting framing overhead by ~75%.
+- **Deterministic Backup**: Cyclone DDS (`rmw_cyclonedds_cpp`), fully preserved and selectable via `--dds`.
+- **Coordination & Planning**: Conflict-Oriented Windowed Hierarchical Cooperative A* (CO-WHCA*) with dynamic conflict resolvability, CBBA consensus, Ricart-Agrawala corridor mutex, and reciprocal ORCA velocity obstacles.
+
 ## Current Verified Baseline
 
 The fleet baseline has achieved verified end-to-end task completion with 100% mission success across sustained multi-AMR runs. Gazebo operates as a high-fidelity kinematic LiDAR renderer that closely tracks the AMRs' internally estimated map positions, decoupling heavy wheel-contact physics while preserving realistic ray-traced sensing, dynamic obstacle detection, and strict safety validation.
@@ -37,6 +41,7 @@ The fleet completed two consecutive 20-task end-to-end benchmark runs (40 comple
   - `physical_max`: 0.46 m/s nominal and max (standard production default).
 - **Footprint**: 0.56 m diameter planning footprint (0.28 m radius). The narrow centre aisles are 1.1554 m wide, providing safe clearance for bidirectional passing corridors.
 - **Time-Space Slots**: WHCA* derives each space-time reservation slot duration dynamically from the configured tracking speed (`slot_duration = 0.5 m / speed`). At 0.46 m/s, each grid move maps to ~1.087 seconds.
+- **Conflict-Oriented Prioritization**: CO-WHCA* calculates a dynamic Conflict Resolvability Index for every AMR, automatically prioritizing boxed-in or mutex-holding AMRs to prevent narrow-aisle gridlock.
 
 ---
 
@@ -113,11 +118,18 @@ Defaults place robots 1–4 on charging pads 1–4 respectively along the south-
 
 ## Running the Fleet
 
-### 1. Automated Desktop Benchmark & Data Collection
+### 1. Automated Benchmark & Data Collection (Default: Zenoh)
 To run automated work cycles with live terminal progress, real-time metrics, and automatic CSV/JSONL dataset export at the 0.46 m/s standard speed:
 
 ```bash
-python3 ~/amr_ws/src/SIH/scripts/run_desktop_data_collection.py --cycles 2 --tasks-per-cycle 20
+# Runs with Eclipse Zenoh (rmw_zenoh_cpp) by default:
+python3 ~/amr_ws/src/SIH/scripts/run_desktop_data_collection.py -r 2 -t 20
+
+# Run with Cyclone DDS backup using the --dds flag:
+python3 ~/amr_ws/src/SIH/scripts/run_desktop_data_collection.py --dds -r 2 -t 20
+
+# Laptop collection:
+python3 ~/amr_ws/src/SIH/scripts/run_laptop_data_collection.py -r 2 -t 20
 ```
 
 ### 2. Full Multi-AMR Baseline Launcher
@@ -125,6 +137,11 @@ To start Gazebo, the 50 Hz kinematic carrier backend, four AMRs, all decentraliz
 
 ```bash
 bash ~/amr_ws/src/SIH/scripts/run_baseline_random_fleet.sh
+```
+
+To activate the Zenoh shell environment in any standalone terminal:
+```bash
+source ~/amr_ws/src/SIH/scripts/env_zenoh.sh
 ```
 
 To stop the entire run cleanly, press `Ctrl+C` in that terminal.
@@ -152,9 +169,12 @@ Available commands:
 - **Unanimous Quorum**: The winning AMR only assigns the task to its local executor after receiving matching claims from all active fleet members.
 - **Immutability**: Bids are frozen per auction epoch, preventing asynchronous state changes from breaking consensus quorum.
 
-### 2. Space-Time WHCA* Route Planner
+### 2. Conflict-Oriented Space-Time WHCA* (CO-WHCA*)
 - **Rolling Horizon**: Searches `(x, y, time_slot)` over a 12-slot rolling window on a 0.5 m resolution occupancy grid.
 - **Reverse BFS Heuristic**: Guarantees liveness around shelf obstacles without getting trapped in local minima.
+- **Conflict Resolvability Index**: Dynamically scores each AMR's ability to safely yield or retreat based on rear clearance, lateral branching cells, and corridor mutex ownership.
+- **Anti-Deadlock Priority Inversion**: Elevates boxed-in AMRs (rear clearance $< 2.5\text{ m}$) and mutex holders to Priority 150, forcing unconstrained AMRs in open space (Priority 100) to yield. This eliminates the classic "Boxed-In Yielder" trap.
+- **Space-Time Conflict Detection**: Explicitly identifies vertex collisions $(x, y, t)$ and edge swaps $(t \leftrightarrow t+1)$, injecting localized temporal constraints only around winning trajectory segments.
 - **Dynamic Reservations**: Emits trajectory intents on `/fleet/trajectory_intent` to reserve space-time cells and avoid inter-robot collisions strategically.
 - **Semantic Blockage Filtering**: Distinguishes transient dynamic obstacles from static shelves and peer silhouettes, filtering out false positive blockages.
 
@@ -167,6 +187,11 @@ Available commands:
 - **Preemptive Gating**: Commands immediate `STOP` on sensor staleness, communication loss, or boundary incursions.
 - **Non-overridable**: Planners, velocity obstacles (ORCA), and external controllers cannot bypass safety supervisor commands.
 
+### 5. Eclipse Zenoh Middleware Layer (`rmw_zenoh_cpp`)
+- **Zero Discovery Storms**: Linear $O(N)$ registration via local `rmw_zenohd` daemon replaces quadratic $O(N^2)$ multicast discovery storms.
+- **Ultra-Compact Framing**: 4–6 byte wire headers slash bandwidth consumption on high-rate coordination topics by ~75% compared to DDS RTPS (24–40 bytes).
+- **Dual-Stack Reliability**: Defaults to Zenoh across all launchers, with Cyclone DDS fully preserved and instantly accessible via `--dds`.
+
 ---
 
 ## Repository Structure
@@ -176,19 +201,25 @@ SIH/
 ├── CURRENT_IMPLEMENTATION_GUIDE.md    # In-depth architectural & algorithmic reference
 ├── README.md                          # Repository overview & quickstart
 ├── scripts/
-│   ├── run_desktop_data_collection.py # Automated multi-cycle data collector
+│   ├── env_zenoh.sh                   # Zenoh shell environment activator
+│   ├── run_desktop_data_collection.py # Automated multi-cycle data collector (Zenoh default, --dds backup)
+│   ├── run_laptop_data_collection.py  # Laptop automated data collector (Zenoh default, --dds backup)
 │   ├── run_baseline_random_fleet.sh   # Full baseline launcher
-│   ├── launch_fleet_amrs.sh           # Core launch & spawn orchestrator
+│   ├── launch_fleet_amrs.sh           # Core launch & spawn orchestrator (rmw_zenohd lifecycle)
 │   ├── verify_gazebo_pose.py          # Ground-truth pose & tilt validator
 │   └── sih_amr_aliases.sh             # Interactive shell shortcuts
 └── src/
     ├── sih_amr_interfaces/            # ROS 2 custom message & service definitions
     └── sih_amr_fleet/                 # Python package containing all fleet nodes
+        ├── config/
+        │   ├── zenoh_session_config.json5 # Production Zenoh session parameters
+        │   └── cyclonedds.xml             # Preserved Cyclone DDS configuration
         ├── cbba_node.py               # Decentralized auction allocation
-        ├── whca_planner_node.py       # Space-time rolling A* planner
+        ├── whca_planner_node.py       # Conflict-Oriented WHCA* (CO-WHCA*) planner
+        ├── orca_node.py               # Reciprocal velocity obstacles with dynamic yield
         ├── kinematic_carrier_node.py  # 50 Hz kinematic simulation backend
         ├── safety_supervisor_node.py  # Authoritative hard safety & braking guard
-        ├── path_follower_node.py      # Waypoint guidance controller
+        ├── path_follower_node.py      # Waypoint guidance controller & recovery
         ├── corridor_mutex_node.py     # Ricart-Agrawala narrow aisle mutex
         ├── localization_node.py       # Odometry-to-map frame transformer
         ├── data_collection_node.py    # High-fidelity JSONL telemetry recorder

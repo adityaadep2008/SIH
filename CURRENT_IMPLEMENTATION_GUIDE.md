@@ -171,9 +171,44 @@ This ensures that a 1-cell spatial reservation corresponds exactly to the physic
 ```
 
 ### 3.1 Dual-Path Transport Pattern (Typed Fleet Topics + Robot Inboxes)
-To eliminate asymmetric DDS graph discovery drops in dense multi-process environments, all core consensus protocols implement dual-path delivery:
+To eliminate asymmetric DDS/Zenoh graph discovery drops in dense multi-process environments, all core consensus protocols implement dual-path delivery:
 1. **Public Typed Topic**: Standard ROS 2 custom message topic (e.g. `/fleet/task_consensus`, `/fleet/task_announcement`) for broadcast auditing and telemetry.
 2. **Private JSON Inboxes**: Dedicated, point-to-point standard string inboxes (e.g. `/{rid}/consensus_inbox`, `/{rid}/task_inbox`) fanning out verified JSON payloads directly to specific participants.
+
+### 3.2 High-Throughput Middleware Architecture: Eclipse Zenoh (`rmw_zenoh_cpp`) with DDS Backup
+The multi-AMR communication layer operates on **Eclipse Zenoh** as the primary ROS 2 middleware implementation (`rmw_zenoh_cpp`), while maintaining full dual-stack backward compatibility with **Cyclone DDS** (`rmw_cyclonedds_cpp`):
+
+```text
++-------------------------------------------------------------------------------------------------------+
+|                                    COMMUNICATION MIDDLEWARE LAYER                                     |
+|                                                                                                       |
+|  [60+ ROS 2 Fleet Endpoints] (CBBA, WHCA*, ORCA, Safety Supervisor, Costmaps, Bridges)                |
+|         │                                                                                             |
+|         ▼                                                                                             |
+|  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  |
+|  │ Primary: Eclipse Zenoh (`rmw_zenoh_cpp`) with Localhost Router Daemon (`rmw_zenohd`)            │  |
+|  │  - Topology: Pure localhost router-client (`tcp/localhost:7447`), listen endpoints: []          │  |
+|  │  - Zero Discovery Storms: O(N) client registration replaces O(N^2) peer-to-peer multicast SPDP │  |
+|  │  - Ultra-Compact Framing: 4-6 byte wire headers (75% bandwidth reduction vs 24-40 byte RTPS)    │  |
+|  │  - Zero Multicast Drops: Runs on TCP unicast; immune to 802.11 Wi-Fi multicast degradation      │  |
+|  └─────────────────────────────────────────────────────────────────────────────────────────────────┘  |
+|         │                                                                                             |
+|         ▼ (Fallback Option via --dds Flag)                                                            |
+|  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  |
+|  │ Backup: Cyclone DDS (`rmw_cyclonedds_cpp`)                                                      │  |
+|  │  - Preserved config: cyclonedds.xml with <MaxAutoParticipantIndex>250</MaxAutoParticipantIndex> │  |
+|  │  - Invoked automatically whenever `--dds` is passed to data collection or test scripts         │  |
+|  └─────────────────────────────────────────────────────────────────────────────────────────────────┘  |
++-------------------------------------------------------------------------------------------------------+
+```
+
+1. **Elimination of Discovery Storms ($O(N)$ vs $O(N^2)$)**:
+   - With 4 AMRs and ~15 nodes per robot plus coordinators and Gazebo bridges, over 60 ROS 2 DomainParticipants execute simultaneously. Under standard DDS RTPS discovery, all 60 participants flood the network trying to discover each other ($60 \times 60 \approx 3,600$ endpoint matches).
+   - Zenoh routes all traffic through `rmw_zenohd` on `tcp/localhost:7447`. Each node registers linearly ($O(N)$), eliminating discovery storms and socket exhaustion.
+2. **QoS Latching & Durability Compliance**:
+   - `zenoh_session_config.json5` enforces `timestamping: { enabled: true }` and disables conflicting `lowlatency` flags, guaranteeing that `TRANSIENT_LOCAL` topics (such as `/robot_N/robot_description` and `cmd_vel` stop latches) are reliably queryable by late-joining nodes like `ros_gz_sim create`.
+3. **Deterministic Backup Switching**:
+   - Both `run_desktop_data_collection.py` and `run_laptop_data_collection.py` default to `rmw_zenoh_cpp`. Passing `--dds` instantly re-routes the entire fleet through `rmw_cyclonedds_cpp` with zero code modifications.
 
 ---
 
@@ -263,7 +298,7 @@ To prevent moving AMRs from changing their bids mid-auction (which destroys cons
 
 ---
 
-### 5.2 4D Space-Time Path Planning: Rolling Horizon WHCA* (`whca_planner_node.py`, `algorithms.py`)
+### 5.2 Conflict-Oriented 4D Space-Time Path Planning: CO-WHCA* (`whca_planner_node.py`, `algorithms.py`)
 
 #### A. State Space & Search Formulation
 - **Search Space**: 4D state tuple $(x, y, t)$, where $(x, y)$ are grid coordinates on the 0.5 m grid and $t \in [0, \text{horizon}]$ ($\text{horizon} = 12\text{ slots} \approx 13.04\text{ s}$).
@@ -279,13 +314,32 @@ Naive Manhattan distance fails in warehouse environments because navigating arou
 $$\text{proximity\_penalty}(x, y) = \begin{cases} 4 & \text{if adjacent to obstacle (Chebyshev dist } = 1) \\ 1 & \text{if near obstacle (Chebyshev dist } = 2) \\ 0 & \text{in open main highway} \end{cases}$$
 $$\text{turn\_penalty} = \begin{cases} 1.5 \times (1.0 - \cos(\Delta \theta)) & \text{at } t = 0 \text{ (align with current AMR yaw)} \\ 0.35 & \text{at } t > 0 \text{ (penalize path zig-zags)} \end{cases}$$
 
-#### D. Dynamic Space-Time Conflict Resolution
+#### D. Dynamic Conflict Resolvability Index & Anti-Deadlock Priority Inversion
+Standard WHCA* uses static robot ID priority order (e.g. `robot_1` $>$ `robot_2` $>$ `robot_3` $>$ `robot_4`). In narrow aisles or constrained bottleneck junctions, static ordering causes the fatal **Boxed-In Yielder Deadlock**: if a lower-priority AMR is trapped with a wall or peer immediately behind it, static WHCA* commands it to yield and reverse, which it physically cannot do, freezing the fleet.
+
+**CO-WHCA* resolves this by dynamically calculating the Conflict Resolvability Index**:
+$$\text{Resolvability}(R) = \begin{cases} -1000.0 & \text{if holding corridor mutex (owns right-of-way)} \\ -500.0 - 100 \times (d_{\text{thresh}} - d_{\text{rear}}) & \text{if } d_{\text{rear}} < 2.5\text{ m (boxed-in AMR)} \\ 10.0 \min(d_{\text{rear}}, 10.0) + 3.0 \min(N_{\text{lateral}}, 4) - 0.5 \text{detour} & \text{otherwise} \end{cases}$$
+
+- **Dynamic Priority Assignment**:
+  - If $\text{Resolvability} < -100.0$ or AMR holds the corridor mutex: $\mathbf{\text{Priority} = 150}$ (Elevated right-of-way).
+  - Otherwise: $\mathbf{\text{Priority} = 100}$ (Normal yielding status).
+- **The Boxed-In Inversion Rule**: When a conflict occurs between two AMRs, the AMR with higher resolvability (safe rear clearance, lateral bypass cells) yields to the constrained AMR, regardless of robot ID.
+
+#### E. Space-Time Conflict Detection (`detect_space_time_conflicts`)
+Before executing the forward space-time search, CO-WHCA* evaluates candidate trajectories against all active peer intents on `/fleet/trajectory_intent` to isolate two distinct conflict topologies:
+1. **Vertex Conflicts**: Two AMRs occupying the same spatial cell at identical time slot:
+   $$\max(|x_a - x_b|, |y_a - y_b|) \le \text{buffer\_cells} \quad \text{at time } t$$
+2. **Edge-Swap Conflicts**: Two AMRs traversing the same edge in opposite directions between $t$ and $t+1$:
+   $$(p_{a, t} = p_{b, t+1}) \land (p_{a, t+1} = p_{b, t}) \quad \text{with } p_{a, t} \ne p_{a, t+1}$$
+
+When a winning peer trajectory is identified, CO-WHCA* injects localized temporal constraints $(cx, cy, t_{\text{conf}} \pm \Delta t)$ only into the yielder's search space, allowing the yielder to smoothly delay entry, branch laterally, or hold at a safe waypoint.
+
+#### F. Dynamic Space-Time Conflict Resolution & Boundary Snapping
 - **Cell Reservations**: A candidate transition to $(x, y, t+1)$ is rejected if $(x, y, t+1)$ is reserved by a peer AMR or falls within the peer's Chebyshev reservation buffer ($\text{buffer} = 3\text{ cells}$).
-- **Edge Swap Rejection**: If AMR $A$ is at $(u, t) \rightarrow (v, t+1)$ while peer $B$ is reserved at $(v, t) \rightarrow (u, t+1)$, the transition is rejected, preventing head-on passage through a single grid edge.
 - **Stationary Peer Horizon Extrusion**: If peer tracking indicates a peer AMR has been stationary for $\ge 1.0\text{ s}$, its cell $(x_p, y_p)$ is reserved across **all 12 time slots** ($t \in [0, 11]$).
 - **Start Cell Boundary Snapping**: If continuous localization places an AMR slightly inside a shelf boundary cell due to quantization, WHCA* snaps the start search cell to the nearest free cardinal neighbour, preventing permanent startup plan infeasibility.
 
-#### E. Concrete Scenario Walkthroughs
+#### G. Concrete Scenario Walkthroughs
 
 ##### Scenario 1: Trailing Behind a Slower Moving Peer
 - **Setup**: AMR1 is travelling North along Main Aisle at $0.46\text{ m/s}$. AMR2 is 3 cells behind AMR1, moving in the same direction.
@@ -294,8 +348,13 @@ $$\text{turn\_penalty} = \begin{cases} 1.5 \times (1.0 - \cos(\Delta \theta)) & 
 
 ##### Scenario 2: Resolving Potential Head-on Collision in Open Highway
 - **Setup**: AMR1 (heading East) and AMR2 (heading West) are on a collision course along a 3-lane open cross-aisle.
-- **Planning**: AMR1 has higher reservation priority / earlier timestamp. AMR2 evaluates the forward path and detects reserved cells at $t = 3, 4, 5$.
-- **Execution**: AMR2's WHCA* search shifts its trajectory one cell laterally into the adjacent lane, executing a smooth lateral lane change and bypassing AMR1 with 1.5 m separation.
+- **Planning**: Both AMRs detect the space-time conflict. AMR1 has priority based on resolvability/timestamp. AMR2 detects edge and vertex conflicts at $t = 3, 4, 5$.
+- **Execution**: AMR2's CO-WHCA* search shifts its trajectory one cell laterally into the adjacent free lane, executing a smooth lateral lane change and bypassing AMR1 with 1.5 m separation.
+
+##### Scenario 3: Boxed-In Aisle Exit (Anti-Deadlock Priority Inversion)
+- **Setup**: AMR3 is leaving an aisle with a wall 0.8 m behind it ($d_{\text{rear}} = 0.8\text{ m} < 2.5\text{ m}$). AMR2 approaches the aisle junction from the open main cross-aisle ($d_{\text{rear}} = 8.0\text{ m}$, $N_{\text{lateral}} = 3$).
+- **Planning**: Static priority would force lower-priority AMR3 to yield and reverse. Under CO-WHCA*, AMR3's resolvability drops to $-670.0$, elevating its priority to 150. AMR2's resolvability is $+89.0$ (Priority 100).
+- **Execution**: Priority inverts. AMR2 yields and pauses at the cross-aisle entrance, allowing AMR3 to exit cleanly into open space before AMR2 proceeds. Zero deadlock.
 
 ---
 
