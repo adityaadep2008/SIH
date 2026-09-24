@@ -120,16 +120,87 @@ def reverse_recovery_allowed(nearest_obstacle_m, reverse_distance_m,
             and nearest_obstacle_m > reverse_distance_m + margin_m)
 
 
-def recovery_yield_priority(inside_protected_resource, conflicting_peer, robot_id):
+def conflict_resolvability_index(rear_clearance_m, reverse_threshold_m=2.5,
+                                 lateral_free_cells=0, holds_mutex=False, detour_penalty=0.0):
+    """Compute the CO-WHCA* Conflict Resolvability Index.
+
+    A robot with negative or very low resolvability cannot safely escape or yield,
+    meaning it must be granted right-of-way. A robot with high resolvability has
+    safe escape, waiting capacity, or lateral branching, and should yield.
+    """
+    if holds_mutex:
+        return -1000.0  # Mutex holder owns right-of-way to exit/clear
+    if math.isfinite(rear_clearance_m) and rear_clearance_m < reverse_threshold_m:
+        # Boxed-in AMR cannot reverse; must be granted right-of-way
+        return -500.0 - (reverse_threshold_m - rear_clearance_m) * 100.0
+
+    score = (
+        10.0 * min(rear_clearance_m if math.isfinite(rear_clearance_m) else 10.0, 10.0) +
+        3.0 * min(lateral_free_cells, 4) -
+        0.5 * max(0.0, detour_penalty)
+    )
+    return score
+
+
+def detect_space_time_conflicts(path_a, path_b, buffer_cells=1):
+    """Detect space-time vertex and edge-swap conflicts between two 4D trajectories.
+
+    Paths are sequences of (x, y, t) tuples.
+    Returns a list of conflict dictionaries:
+    {'time': t, 'type': 'vertex'|'edge_swap', 'pos_a': (xa, ya), 'pos_b': (xb, yb)}
+    """
+    if not path_a or not path_b:
+        return []
+    time_map_a = {t: (x, y) for x, y, t in path_a}
+    time_map_b = {t: (x, y) for x, y, t in path_b}
+    common_times = set(time_map_a.keys()) & set(time_map_b.keys())
+    conflicts = []
+
+    for t in sorted(common_times):
+        xa, ya = time_map_a[t]
+        xb, yb = time_map_b[t]
+        if max(abs(xa - xb), abs(ya - yb)) <= buffer_cells:
+            conflicts.append({
+                'time': t,
+                'type': 'vertex',
+                'pos_a': (xa, ya),
+                'pos_b': (xb, yb),
+            })
+
+    for t in sorted(common_times):
+        if (t + 1) in common_times:
+            p_a_t, p_a_next = time_map_a[t], time_map_a[t + 1]
+            p_b_t, p_b_next = time_map_b[t], time_map_b[t + 1]
+            if p_a_next == p_b_t and p_b_next == p_a_t and p_a_t != p_a_next:
+                conflicts.append({
+                    'time': t,
+                    'type': 'edge_swap',
+                    'pos_a': p_a_t,
+                    'pos_b': p_b_t,
+                })
+    return conflicts
+
+
+def recovery_yield_priority(inside_protected_resource, conflicting_peer, robot_id,
+                            rear_clearance_m=math.inf, reverse_threshold_m=2.5,
+                            self_priority=100, peer_priority=100):
     """Determine whether this robot should yield and initiate recovery retreat/replan.
 
     If the AMR is inside/holding a protected corridor mutex (inside_protected_resource=True),
     it owns the right-of-way to exit into the cross-aisle; outside waiting peers must not
     force it to retreat.
-    In open/unprotected space, break symmetry using standard deterministic peer ID comparison.
+    If the AMR has insufficient rear clearance (< reverse_threshold_m), it CANNOT reverse
+    and must not be designated as the yielder (preventing the Boxed-In Yielder trap).
+    If dynamic CO-WHCA* priorities differ, the lower-priority AMR yields.
+    In open/unprotected space with equal priority and clearance, break symmetry using standard
+    deterministic peer ID comparison.
     """
     if inside_protected_resource:
         return False
+    if math.isfinite(rear_clearance_m) and rear_clearance_m < reverse_threshold_m:
+        return False
+    if self_priority != peer_priority:
+        return self_priority < peer_priority
     if conflicting_peer:
         return conflicting_peer < robot_id
     return True
@@ -269,7 +340,7 @@ def filter_unexpected_blockages(cells, expected_cells, robot_cells, width, heigh
 
 
 def whca_star(start, goal, blocked, reservations, width, height, horizon,
-              reservation_buffer_cells=1, heading_rad=None):
+              reservation_buffer_cells=1, heading_rad=None, constraints=None):
     """Return a 4-connected, time-indexed path or an empty list.
 
     ``reservations`` contains (x, y, time_slot) held by other robots.  At a
@@ -277,9 +348,13 @@ def whca_star(start, goal, blocked, reservations, width, height, horizon,
     buffer around each peer reservation (one cell in every direction by
     default). Edge swaps are rejected to prevent head-on passage through one
     grid edge.
+    ``constraints`` (optional) contains space-time cells (x, y, time_slot) or
+    spatial cells (x, y) that this robot must avoid due to CO-WHCA* conflict
+    resolution.
     """
     start = (int(start[0]), int(start[1]))
     goal = (int(goal[0]), int(goal[1]))
+    constraints_set = set(constraints) if constraints else set()
     if goal in blocked:
         return []
     if start in blocked:
@@ -377,6 +452,8 @@ def whca_star(start, goal, blocked, reservations, width, height, horizon,
             nx, ny, nt = x + dx, y + dy, t + 1
             candidate = (nx, ny, nt)
             if not (0 <= nx < width and 0 <= ny < height) or (nx, ny) in blocked:
+                continue
+            if constraints_set and (candidate in constraints_set or (nx, ny) in constraints_set or (nx, ny, None) in constraints_set):
                 continue
             conflict = False
             for rx, ry, rt in reservations:
@@ -493,9 +570,11 @@ class ConstantVelocityTrack:
         self.variance *= (1.0 - gain)
 
 
-def avoidance_velocity(preferred, self_xy, peers, radius, horizon, max_speed, self_id=None):
+def avoidance_velocity(preferred, self_xy, peers, radius, horizon, max_speed,
+                       self_id=None, self_priority=100):
     """Reciprocal velocity-obstacle approximation with uncertainty inflation and 2D CPA."""
     vx, vy = preferred
+    self_prio = self_priority if self_priority is not None else 100
     for peer in peers:
         dx, dy = peer['x'] - self_xy[0], peer['y'] - self_xy[1]
         separation = math.hypot(dx, dy)
@@ -533,10 +612,19 @@ def avoidance_velocity(preferred, self_xy, peers, radius, horizon, max_speed, se
             overlap = 2.0 * effective_radius - d_min
             push = overlap / max(t_star, 0.2)
             peer_speed = math.hypot(peer_vx, peer_vy)
+            peer_prio = peer.get('priority', 100)
+
             if peer_speed < 0.05:
                 # A stationary peer cannot yield; the moving AMR takes full responsibility
                 yield_factor = 1.0
+            elif self_prio > peer_prio:
+                # Self has space-time conflict right-of-way; maintain trajectory
+                yield_factor = 0.0
+            elif self_prio < peer_prio:
+                # Self is yielding/subordinate; take full responsibility to avoid
+                yield_factor = 1.0
             else:
+                # Equal priority: balanced reciprocal split
                 yield_factor = 0.5
 
             if yield_factor > 0.0:

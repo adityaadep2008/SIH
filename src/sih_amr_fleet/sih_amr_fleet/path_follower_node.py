@@ -300,8 +300,13 @@ class PathFollowerNode(Node):
                   now >= self.recovery_cooldown_until):
                 # Break symmetry:
                 # 1. An AMR inside a protected corridor owns right-of-way to exit; outside waiting peers must not force it to retreat.
-                # 2. In open space, use standard robot-ID tie-breaking.
-                is_yielder = recovery_yield_priority(self.protected, conflicting_peer, self.robot_id)
+                # 2. An AMR with obstructed rear clearance (< reverse threshold) cannot safely retreat and must not yield.
+                # 3. In open space, use standard tie-breaking.
+                is_yielder = recovery_yield_priority(
+                    self.protected, conflicting_peer, self.robot_id,
+                    rear_clearance_m=self.reverse_clearance,
+                    reverse_threshold_m=(self.recovery_reverse_m + self.recovery_margin_m)
+                )
                 if is_yielder:
                     self.recovery_state, self.recovery_started = 'VERIFY', now
                     self.publish_event('recovery_stop', f'stall detected with peer {conflicting_peer or "obstacle"}')

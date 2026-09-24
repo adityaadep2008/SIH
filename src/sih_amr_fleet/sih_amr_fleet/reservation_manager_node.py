@@ -42,7 +42,8 @@ class ReservationManagerNode(Node):
             return
         self.sequence += 1; msg = TrajectoryIntent()
         msg.fleet_header = header(self, self.robot_id, self.session_id, self.sequence, 1.5)
-        msg.plan_id, msg.t0, msg.dt_seconds, msg.reservations, msg.priority = self.current.plan_id, msg.fleet_header.sent_at, self.dt, self.current.cells, self.priority
+        route_priority = getattr(self.current, 'priority', self.priority)
+        msg.plan_id, msg.t0, msg.dt_seconds, msg.reservations, msg.priority = self.current.plan_id, msg.fleet_header.sent_at, self.dt, self.current.cells, (route_priority if route_priority != 0 else self.priority)
         self.pub.publish(msg)
 
 

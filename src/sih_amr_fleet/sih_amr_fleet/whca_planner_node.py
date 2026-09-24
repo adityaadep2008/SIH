@@ -9,9 +9,11 @@ from sih_amr_interfaces.msg import (
     BlockageObservation, CorridorProtocol, GridCell, RobotState, RoutePlan, TaskAssignment,
     TaskExecutionStatus, TrajectoryIntent
 )
+from std_msgs.msg import Float32
 
 from .algorithms import (
-    clear_nearfield_blockages, lane_waypoint_overrides, whca_star
+    clear_nearfield_blockages, conflict_resolvability_index,
+    detect_space_time_conflicts, lane_waypoint_overrides, whca_star
 )
 from .common import FLEET_STATE_QOS, POSE_QOS, PROTOCOL_QOS, header, new_session_id, now_seconds, stamp_seconds
 from .map_geometry import map_geometry_from_data
@@ -54,6 +56,9 @@ class WhcaPlannerNode(Node):
         self.corridors = {}
         self.occupied_corridors = {}
         self.peer_tracking = {}
+        self.reverse_clearance = math.inf
+        self.current_priority = 100
+        self.last_path = []
 
         if map_file:
             self.load_map(map_file)
@@ -69,6 +74,7 @@ class WhcaPlannerNode(Node):
         self.create_subscription(BlockageObservation, '/fleet/blockage_observation', self.on_blockage, PROTOCOL_QOS)
         self.create_subscription(CorridorProtocol, '/fleet/corridor_protocol', self.on_corridor, PROTOCOL_QOS)
         self.create_subscription(Pose2D, 'docking/target', lambda msg: setattr(self, 'docking_target', msg), FLEET_STATE_QOS)
+        self.create_subscription(Float32, 'reverse_clearance_m', lambda msg: setattr(self, 'reverse_clearance', msg.data), POSE_QOS)
         self.create_timer(1.0, self.plan)
 
     def load_map(self, filename):
@@ -292,12 +298,55 @@ class WhcaPlannerNode(Node):
             clearance_cells=1,
         )
 
+        # Determine dynamic CO-WHCA* priority based on conflict resolvability
+        holds_mutex = bool(self.occupied_corridors.get(self.robot_id))
+        rear_clear = self.reverse_clearance
+        if self.pose is not None:
+            for rid, pinfo in self.peer_tracking.items():
+                if now - pinfo['last_seen'] < 3.0:
+                    p = pinfo['pose']
+                    dx, dy = p.x - self.pose.x, p.y - self.pose.y
+                    dist = math.hypot(dx, dy)
+                    along = dx * math.cos(self.pose.theta) + dy * math.sin(self.pose.theta)
+                    if along < -0.2 and dist < 2.5:
+                        rear_clear = min(rear_clear, dist)
+
+        resolvability = conflict_resolvability_index(
+            rear_clearance_m=rear_clear,
+            reverse_threshold_m=2.5,
+            lateral_free_cells=2,
+            holds_mutex=holds_mutex,
+        )
+        if holds_mutex or resolvability < -100.0:
+            priority = 150  # Elevated right-of-way for boxed-in or mutex-holding AMRs
+        else:
+            priority = 100
+        self.current_priority = priority
+
+        # Detect space-time conflicts with peer intents
+        constraints = set()
+        for peer_intent in list(self.peer_intents.values()):
+            if stamp_seconds(peer_intent.fleet_header.valid_until) >= now:
+                peer_id = peer_intent.fleet_header.robot_id
+                peer_prio = getattr(peer_intent, 'priority', 100) or 100
+                peer_wins = (peer_prio > priority) or (peer_prio == priority and peer_id < self.robot_id)
+                if peer_wins and self.last_path:
+                    peer_cells = [(c.x, c.y, c.time_slot) for c in peer_intent.reservations]
+                    conflicts = detect_space_time_conflicts(self.last_path, peer_cells, buffer_cells=self.reservation_buffer_cells)
+                    if conflicts:
+                        for conf in conflicts:
+                            t_conf = conf['time']
+                            cx, cy = conf['pos_a']
+                            for dt in range(max(0, t_conf - 1), min(self.horizon, t_conf + 3)):
+                                constraints.add((cx, cy, dt))
+
         heading = self.pose.theta if self.pose is not None else None
         path = whca_star(
             start, goal, self.static_blocked | planning_blockages, reservations,
             self.width, self.height, self.horizon, self.reservation_buffer_cells,
-            heading_rad=heading
+            heading_rad=heading, constraints=constraints
         )
+        self.last_path = path
         task_id = self.assignment.task.task_id if self.assignment else ('docking' if self.docking_target else 'idle')
         if not path:
             self.get_logger().warning(
@@ -306,7 +355,7 @@ class WhcaPlannerNode(Node):
                 f'(static={start in self.static_blocked}, dynamic={start in self.blockages}), '
                 f'goal={goal} (static={goal in self.static_blocked}, dynamic={goal in self.blockages}), '
                 f'static_cells={len(self.static_blocked)}, dynamic_cells={len(planning_blockages)} '
-                f'(raw={len(self.blockages)}), reservations={len(reservations)}. '
+                f'(raw={len(self.blockages)}), reservations={len(reservations)}, constraints={len(constraints)}. '
                 f'Reason=no conflict-free route in current WHCA* window.',
                 throttle_duration_sec=3.0,
             )
@@ -315,7 +364,7 @@ class WhcaPlannerNode(Node):
                 f'[{self.robot_id}:WHCA] Decision: ROUTE_FEASIBLE for task={task_id}. '
                 f'Actor=WhcaPlanner:{self.robot_id}. Info: start={start} -> goal={goal}, '
                 f'steps={len(path)}, waypoints={len(path)}, reservations={len(reservations)}, '
-                f'dynamic_cells={len(planning_blockages)}.',
+                f'dynamic_cells={len(planning_blockages)}, priority={priority}.',
                 throttle_duration_sec=5.0,
             )
 
@@ -329,6 +378,7 @@ class WhcaPlannerNode(Node):
         msg.failure_reason = '' if path else 'no conflict-free route in current WHCA* window'
         msg.cells = [GridCell(x=x, y=y, time_slot=t) for x, y, t in path]
         msg.waypoints = [self.to_pose((x, y)) for x, y, _ in path]
+        msg.priority = int(priority)
         if path and (path[-1][0], path[-1][1]) == goal and target is not None:
             msg.waypoints[-1] = Pose2D(
                 x=float(target.x),

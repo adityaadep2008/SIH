@@ -12,6 +12,7 @@ from sih_amr_fleet.algorithms import (
     map_transform_for_anchor,
     local_point_to_grid_cell, recovery_yield_priority, reverse_recovery_allowed,
     sensor_point_to_base, static_grid_path_distance, whca_star,
+    conflict_resolvability_index, detect_space_time_conflicts,
 )
 from sih_amr_fleet.map_geometry import map_geometry_from_data
 from sih_amr_fleet.warehouse_tasks import Lane, aisle_points, narrow_lanes
@@ -1641,6 +1642,96 @@ def test_whca_planner_destination_inside_mutex_corridor():
         assert bool(path), "Path to goal inside corridor must be feasible"
     finally:
         node.destroy_node()
+
+
+def test_co_whca_conflict_resolvability_boxed_in_vs_free():
+    # Boxed-in robot (rear clearance 1.28m < 2.5m) gets extreme negative score (must have right-of-way)
+    score_boxed_in = conflict_resolvability_index(rear_clearance_m=1.28, reverse_threshold_m=2.5)
+    assert score_boxed_in < -100.0, "Boxed-in AMR must receive high priority (negative resolvability)"
+
+    # Free robot with 5.0m clearance has positive resolvability (can yield or hold)
+    score_free = conflict_resolvability_index(rear_clearance_m=5.0, reverse_threshold_m=2.5, lateral_free_cells=2)
+    assert score_free > 0.0
+
+    # Mutex holder always receives lowest resolvability (absolute right-of-way)
+    score_mutex = conflict_resolvability_index(rear_clearance_m=5.0, holds_mutex=True)
+    assert score_mutex == -1000.0
+
+
+def test_co_whca_detect_space_time_conflicts_vertex_and_edge_swap():
+    # Path A: moving East (1, 1, 0) -> (2, 1, 1) -> (3, 1, 2)
+    # Path B: moving West (3, 1, 0) -> (2, 1, 1) -> (1, 1, 2)
+    path_a = [(1, 1, 0), (2, 1, 1), (3, 1, 2)]
+    path_b = [(3, 1, 0), (2, 1, 1), (1, 1, 2)]
+
+    conflicts = detect_space_time_conflicts(path_a, path_b, buffer_cells=0)
+    assert any(c['type'] == 'vertex' and c['time'] == 1 and c['pos_a'] == (2, 1) for c in conflicts)
+
+    # Edge swap: path A goes (4, 4) at t=0 to (5, 4) at t=1, path B goes (5, 4) at t=0 to (4, 4) at t=1
+    path_c = [(4, 4, 0), (5, 4, 1)]
+    path_d = [(5, 4, 0), (4, 4, 1)]
+    swap_conflicts = detect_space_time_conflicts(path_c, path_d, buffer_cells=0)
+    assert any(c['type'] == 'edge_swap' and c['time'] == 0 for c in swap_conflicts)
+
+
+def test_co_whca_recovery_yield_priority_boxed_in_amr_does_not_yield():
+    # In desktop_run_008, robot_3 had rear clearance 1.28m < 2.5m facing robot_2.
+    # Standard string comparison would force robot_3 to yield ('robot_2' < 'robot_3').
+    # CO-WHCA* prevents boxed-in yielder deadlock:
+    robot_3_yields = recovery_yield_priority(
+        inside_protected_resource=False,
+        conflicting_peer='robot_2',
+        robot_id='robot_3',
+        rear_clearance_m=1.28,
+        reverse_threshold_m=2.5,
+    )
+    assert not robot_3_yields, "Boxed-in robot_3 must NOT yield when rear clearance is obstructed"
+
+    # robot_2 has open rear clearance (4.0m) and lower priority (100 vs robot_3's 150)
+    # CO-WHCA* priority inversion ensures robot_2 yields to unblock the boxed-in peer
+    robot_2_yields = recovery_yield_priority(
+        inside_protected_resource=False,
+        conflicting_peer='robot_3',
+        robot_id='robot_2',
+        rear_clearance_m=4.0,
+        reverse_threshold_m=2.5,
+        self_priority=100,
+        peer_priority=150,
+    )
+    assert robot_2_yields, "robot_2 with lower priority must yield to unblock the boxed-in peer"
+
+
+def test_co_whca_star_obeys_negative_space_time_constraints():
+    # Planning from (0, 0) to (4, 0) with a negative constraint on junction (2, 0) at time slot 2
+    # The planner must avoid (2, 0, 2)
+    path = whca_star(
+        start=(0, 0),
+        goal=(4, 0),
+        blocked=set(),
+        reservations=set(),
+        width=10,
+        height=10,
+        horizon=10,
+        constraints={(2, 0, 2)},
+    )
+    assert path, "Path must remain feasible via detours or waiting"
+    for x, y, t in path:
+        assert not (x == 2 and y == 0 and t == 2), "Path must not occupy constrained space-time cell"
+
+
+def test_co_whca_avoidance_velocity_asymmetric_priority_reciprocity():
+    # Peer is directly ahead, closing head-on
+    preferred = (0.5, 0.0)
+    self_xy = (0.0, 0.0)
+    peers = [{'x': 1.0, 'y': 0.0, 'vx': -0.5, 'vy': 0.0, 'priority': 100}]
+
+    # 1. When self has higher priority (priority=150 > peer=100), self holds course (yield_factor=0.0)
+    vx_prio, _ = avoidance_velocity(preferred, self_xy, peers, radius=0.35, horizon=2.0, max_speed=1.0, self_priority=150)
+    assert vx_prio == pytest.approx(0.5), "High-priority AMR must maintain forward preferred velocity"
+
+    # 2. When self is subordinate (priority=50 < peer=100), self yields fully (yield_factor=1.0)
+    vx_sub, _ = avoidance_velocity(preferred, self_xy, peers, radius=0.35, horizon=2.0, max_speed=1.0, self_priority=50)
+    assert vx_sub < 0.2, "Subordinate AMR must yield to oncoming priority peer"
 
 
 

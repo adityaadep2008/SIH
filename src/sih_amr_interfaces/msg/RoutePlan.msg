@@ -5,3 +5,4 @@ geometry_msgs/Pose2D[] waypoints
 GridCell[] cells
 bool route_feasible
 string failure_reason
+uint8 priority 100

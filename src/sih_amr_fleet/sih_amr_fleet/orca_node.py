@@ -2,10 +2,10 @@ import math
 import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
-from sih_amr_interfaces.msg import PeerTrackArray, RobotState
+from sih_amr_interfaces.msg import PeerTrackArray, RobotState, RoutePlan, TrajectoryIntent
 
 from .algorithms import avoidance_velocity, finite_command
-from .common import FLEET_STATE_QOS, POSE_QOS
+from .common import FLEET_STATE_QOS, POSE_QOS, PROTOCOL_QOS
 
 
 class OrcaNode(Node):
@@ -16,13 +16,26 @@ class OrcaNode(Node):
         self.max_speed = self.declare_parameter('max_speed_mps', 6.0).value
         self.robot_id = self.declare_parameter('robot_id', 'robot_1').value
         self.pose, self.desired, self.tracks = None, Twist(), []
+        self.peer_priorities = {}
+        self.self_priority = 100
         self._received_local_state = False
         self.pub = self.create_publisher(Twist, 'cmd_vel_candidate', FLEET_STATE_QOS)
         self.create_subscription(RobotState, '/fleet/robot_state', self.on_state, FLEET_STATE_QOS)
         self.create_subscription(RobotState, 'state', self.on_local_state, POSE_QOS)
         self.create_subscription(Twist, 'cmd_vel_desired', lambda msg: setattr(self, 'desired', msg), FLEET_STATE_QOS)
         self.create_subscription(PeerTrackArray, 'peer_tracks', lambda msg: setattr(self, 'tracks', msg.tracks), FLEET_STATE_QOS)
+        self.create_subscription(TrajectoryIntent, '/fleet/trajectory_intent', self.on_intent, PROTOCOL_QOS)
+        self.create_subscription(RoutePlan, 'planned_route', self.on_route, FLEET_STATE_QOS)
         self.create_timer(0.1, self.control)
+
+    def on_intent(self, msg):
+        rid = msg.fleet_header.robot_id
+        if rid != self.robot_id:
+            self.peer_priorities[rid] = msg.priority
+
+    def on_route(self, msg):
+        if msg.route_feasible:
+            self.self_priority = getattr(msg, 'priority', 100) or 100
 
     def on_state(self, msg):
         if msg.fleet_header.robot_id == self.robot_id:
@@ -43,12 +56,14 @@ class OrcaNode(Node):
             peers = [
                 {'x': p.pose.x, 'y': p.pose.y, 'vx': p.twist.linear.x, 'vy': p.twist.linear.y,
                  'radius_inflation': 2.0 * math.sqrt(max(p.covariance_trace, 0.0)),
-                 'id': getattr(p, 'robot_id', '')}
+                 'id': getattr(p, 'robot_id', ''),
+                 'priority': self.peer_priorities.get(getattr(p, 'robot_id', ''), 100)}
                 for p in self.tracks
                 if all(math.isfinite(value) for value in (
                     p.pose.x, p.pose.y, p.twist.linear.x, p.twist.linear.y, p.covariance_trace))
             ]
-            vx, vy = avoidance_velocity(preferred, (self.pose.x, self.pose.y), peers, self.radius, 1.5, self.max_speed, self_id=self.robot_id)
+            vx, vy = avoidance_velocity(preferred, (self.pose.x, self.pose.y), peers, self.radius, 1.5, self.max_speed,
+                                        self_id=self.robot_id, self_priority=self.self_priority)
             raw_linear_x = vx * direction[0] + vy * direction[1]
             if self.desired.linear.x < -0.01:
                 result.linear.x = max(-self.max_speed, self.desired.linear.x)
