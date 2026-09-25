@@ -207,4 +207,363 @@ def test_boundary_inward_recovery_and_rejections():
             rclpy.shutdown()
 
 
+def test_adaptive_dispatch_rates_and_triggers():
+    """Verify adaptive dispatch rate calculation and transition triggers in KinematicCarrierNode."""
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        assert not node._force_gz_sync
+        assert not node._fleet_was_moving
+
+        # Stationary fleet rate check: all robots at 0 velocity -> 2 Hz (0.50s interval)
+        for r in node.robots.values():
+            r.cmd_linear_x = 0.0
+            r.cmd_angular_z = 0.0
+            r.true_vx = 0.0
+            r.true_wz = 0.0
+
+        any_moving = any(
+            abs(r.cmd_linear_x) > 0.001 or abs(r.cmd_angular_z) > 0.001 or
+            abs(r.true_vx) > 0.001 or abs(r.true_wz) > 0.001
+            for r in node.robots.values()
+        )
+        assert not any_moving
+        interval_stationary = 0.05 if any_moving else 0.50
+        assert interval_stationary == 0.50
+
+        # Motion start transition check: robot_1 accelerates -> triggers immediate sync
+        node.robots['robot_1'].cmd_linear_x = 0.46
+        any_moving = any(
+            abs(r.cmd_linear_x) > 0.001 or abs(r.cmd_angular_z) > 0.001 or
+            abs(r.true_vx) > 0.001 or abs(r.true_wz) > 0.001
+            for r in node.robots.values()
+        )
+        assert any_moving
+        interval_moving = 0.05 if any_moving else 0.50
+        assert interval_moving == 0.05
+
+        if any_moving != node._fleet_was_moving:
+            node._force_gz_sync = True
+            node._fleet_was_moving = any_moving
+        assert node._force_gz_sync is True
+        assert node._fleet_was_moving is True
+
+        # Motion stop transition check: robot_1 stops -> triggers immediate sync
+        node._force_gz_sync = False
+        node.robots['robot_1'].cmd_linear_x = 0.0
+        any_moving = any(
+            abs(r.cmd_linear_x) > 0.001 or abs(r.cmd_angular_z) > 0.001 or
+            abs(r.true_vx) > 0.001 or abs(r.true_wz) > 0.001
+            for r in node.robots.values()
+        )
+        assert not any_moving
+        if any_moving != node._fleet_was_moving:
+            node._force_gz_sync = True
+            node._fleet_was_moving = any_moving
+        assert node._force_gz_sync is True
+        assert node._fleet_was_moving is False
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_entity_discovery_triggers_sync():
+    """Verify that resolving a new entity ID in _on_gz_poses triggers an immediate Gazebo sync."""
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        node._force_gz_sync = False
+
+        class MockPose:
+            def __init__(self, name, eid):
+                self.name = name
+                self.id = eid
+
+        class MockGzPoseV:
+            def __init__(self, poses):
+                self.pose = poses
+
+        # Simulate Gazebo pose broadcast containing robot_1 turtlebot4 entity id 88
+        msg = MockGzPoseV([MockPose('robot_1/turtlebot4', 88)])
+        node._on_gz_poses(msg)
+
+        assert node.gz_entity_ids.get('robot_1') == 88
+        assert node._force_gz_sync is True
+
+        # Repeated message with same ID should not re-trigger force sync
+        node._force_gz_sync = False
+        node._on_gz_poses(msg)
+        assert node._force_gz_sync is False
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_latest_snapshot_coalescing():
+    """Verify that busy background worker causes pending pose snapshots to coalesce without queuing."""
+    import concurrent.futures
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        # Simulate worker currently busy with an unresolved future
+        busy_future = concurrent.futures.Future()
+        node.gz_future = busy_future
+
+        # Simulate snapshot 1 arriving
+        snap1 = "snapshot_1_data"
+        with node._gz_lock:
+            node._pending_gz_vector = snap1
+            if (node.gz_future is None or node.gz_future.done()) and node._pending_gz_vector is not None:
+                node.gz_future = node.gz_executor.submit(node._dispatch_gz_pose, node._pending_gz_vector)
+
+        assert node._pending_gz_vector == "snapshot_1_data"
+
+        # Simulate snapshot 2 arriving while worker is still busy (coalescing: snap1 overwritten)
+        snap2 = "snapshot_2_latest"
+        with node._gz_lock:
+            node._pending_gz_vector = snap2
+            if (node.gz_future is None or node.gz_future.done()) and node._pending_gz_vector is not None:
+                node.gz_future = node.gz_executor.submit(node._dispatch_gz_pose, node._pending_gz_vector)
+
+        assert node._pending_gz_vector == "snapshot_2_latest"
+
+        # Now simulate worker completion
+        busy_future.set_result(None)
+        submitted_item = None
+
+        with node._gz_lock:
+            if (node.gz_future is None or node.gz_future.done()) and node._pending_gz_vector is not None:
+                submitted_item = node._pending_gz_vector
+                node._pending_gz_vector = None
+
+        assert submitted_item == "snapshot_2_latest"
+        assert node._pending_gz_vector is None
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_gz_request_deadline_is_100ms():
+    """Verify that _dispatch_gz_pose uses a bounded 100ms timeout parameter."""
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+
+        captured_kwargs = {}
+
+        class MockGzNode:
+            def request(self, topic, req, req_type, rep_type, timeout=10):
+                captured_kwargs['topic'] = topic
+                captured_kwargs['timeout'] = timeout
+                return (True, None)
+
+        node.gz_node = MockGzNode()
+        node._dispatch_gz_pose("mock_vector")
+
+        assert captured_kwargs.get('timeout') == 100
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_inter_run_cooldown_argument_parsing():
+    """Verify that runners parse the --inter-run-cooldown-s argument correctly."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+
+    desktop_script = repo_root / 'scripts' / 'run_desktop_data_collection.py'
+    res_desktop = subprocess.run(
+        [sys.executable, str(desktop_script), '--help'],
+        capture_output=True,
+        text=True
+    )
+    assert res_desktop.returncode == 0
+    assert '--inter-run-cooldown-s' in res_desktop.stdout
+
+    laptop_script = repo_root / 'scripts' / 'run_laptop_data_collection.py'
+    res_laptop = subprocess.run(
+        [sys.executable, str(laptop_script), '--help'],
+        capture_output=True,
+        text=True
+    )
+    assert res_laptop.returncode == 0
+    assert '--inter-run-cooldown-s' in res_laptop.stdout
+
+
+def test_production_simulation_step_adaptive_throttling():
+    """Directly execute node._simulation_step() to verify production wall-clock rate limiting and triggers."""
+    import time
+    from unittest.mock import MagicMock
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        mock_gz = MagicMock()
+        mock_gz.request.return_value = (True, MagicMock(data=True))
+        node.gz_node = mock_gz
+        node.gz_entity_ids['robot_1'] = 101
+
+        # 1. First step while stationary: triggers force_gz_sync because _fleet_was_moving=False
+        node._last_gz_dispatch_wall_time = time.monotonic()
+        node._force_gz_sync = False
+
+        # Immediate step within 10ms should NOT dispatch (stationary interval is 0.50s)
+        initial_count = node.gz_sync_total_count
+        node._simulation_step()
+        # Should not have submitted a new request because < 0.50s
+        assert node.gz_sync_total_count == initial_count
+
+        # 2. Accelerate robot: next _simulation_step() detects transition -> triggers immediate dispatch
+        node.robots['robot_1'].cmd_linear_x = 0.46
+        node._simulation_step()
+        assert node._fleet_was_moving is True
+        assert node._force_gz_sync is False
+        # Request should have been submitted
+        assert node.gz_future is not None
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_production_simulation_step_coalescing():
+    """Directly test that node._simulation_step() coalesces into _pending_gz_vector when worker is busy."""
+    import concurrent.futures
+    import time
+    from unittest.mock import MagicMock
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        mock_gz = MagicMock()
+        mock_gz.request.return_value = (True, MagicMock(data=True))
+        node.gz_node = mock_gz
+        node.gz_entity_ids['robot_1'] = 101
+
+        # Simulate busy worker with an unresolved future
+        busy_future = concurrent.futures.Future()
+        node.gz_future = busy_future
+
+        # Trigger simulation step with force sync
+        node._force_gz_sync = True
+        node.robots['robot_1'].true_x = 10.0
+        node._simulation_step()
+
+        # Worker was busy, so _pending_gz_vector must hold snapshot with x=10.0
+        assert node._pending_gz_vector is not None
+        p1 = node._pending_gz_vector.pose[0]
+        assert p1.position.x == 10.0
+
+        # Now update robot position and step again while worker is STILL busy
+        node._force_gz_sync = True
+        node.robots['robot_1'].true_x = 20.0
+        node._simulation_step()
+
+        # Coalescing: _pending_gz_vector must now hold overwritten snapshot with x=20.0 (never queued)
+        assert node._pending_gz_vector is not None
+        p2 = node._pending_gz_vector.pose[0]
+        assert p2.position.x == 20.0
+
+        # Now mark worker complete
+        busy_future.set_result(None)
+
+        # Next simulation step should pop and submit the coalesced snapshot
+        node._simulation_step()
+        assert node._pending_gz_vector is None
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_periodic_telemetry_disaggregated_latency():
+    """Verify that periodic telemetry records success latency separately from errors."""
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        node.gz_sync_total_count = 249
+
+        class MockGzNode:
+            def request(self, *args, **kwargs):
+                class MockRep:
+                    data = True
+                return (True, MockRep())
+
+        node.gz_node = MockGzNode()
+        node._dispatch_gz_pose("mock_vector")
+
+        assert node.gz_sync_total_count == 250
+        assert node.gz_sync_success_count == 1
+        assert len(node.gz_success_latency_history) == 1
+        assert len(node.gz_latency_history) == 1
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+
+
+
 

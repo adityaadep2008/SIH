@@ -431,6 +431,8 @@ class DesktopCycleRun:
         )
 
         output_queue = queue.Queue()
+        launcher_log_path = self.log_dir / "launcher.log"
+        launcher_log_fd = open(launcher_log_path, "w", encoding="utf-8", buffering=1)
 
         def stream_reader():
             try:
@@ -454,6 +456,9 @@ class DesktopCycleRun:
                 while not output_queue.empty():
                     try:
                         lline = output_queue.get_nowait()
+                        if launcher_log_fd:
+                            launcher_log_fd.write(lline)
+                            launcher_log_fd.flush()
                         self.parse_launcher_line(lline)
                     except queue.Empty:
                         break
@@ -502,9 +507,34 @@ class DesktopCycleRun:
 
                 time.sleep(0.1)
 
+            # Drain any remaining lines from launcher output queue
+            while not output_queue.empty():
+                try:
+                    lline = output_queue.get_nowait()
+                    if launcher_log_fd:
+                        launcher_log_fd.write(lline)
+                        launcher_log_fd.flush()
+                    self.parse_launcher_line(lline)
+                except queue.Empty:
+                    break
+
+            # Capture process exit status if it exited prematurely
+            return_code = self.process.poll()
+            if return_code is not None and self.status == "PENDING":
+                if return_code != 0:
+                    self.status = f"FAILED(exit_code={return_code})"
+                    self.print_stage_event("✖", C_RED, "RUN FAILED", f"Launcher process exited with code {return_code} (see launcher.log)")
+                else:
+                    self.status = "LAUNCHER_EXITED"
+
         except KeyboardInterrupt:
             self.status = "ABORTED"
         finally:
+            if launcher_log_fd:
+                try:
+                    launcher_log_fd.close()
+                except Exception:
+                    pass
             if fleet_log_fd:
                 fleet_log_fd.close()
             if telemetry_fd:
@@ -547,6 +577,7 @@ def main():
     repo_root = Path(__file__).resolve().parent.parent
     parser.add_argument("-d", "--compile-dataset", action="store_true", help="Rebuild the complete desktop dataset from all saved desktop telemetry after the run")
     parser.add_argument("-o", "--output-csv", default=str(repo_root / "collected_datasets_desktop.csv"), help="Dataset output path used with -d")
+    parser.add_argument("--inter-run-cooldown-s", type=float, default=0.0, help="Optional cooldown delay in seconds between consecutive benchmark runs for A/B testing")
     args = parser.parse_args()
 
     world_file = None
@@ -586,6 +617,9 @@ def main():
             if run.status == "ABORTED":
                 print(f"\n{C_YELLOW}Run {idx} was aborted. Halting remaining runs.{C_RESET}")
                 break
+            if idx < args.runs and args.inter_run_cooldown_s > 0:
+                print(f"\n{C_CYAN}⏳ Inter-run cooldown: waiting {args.inter_run_cooldown_s:.1f}s before run {idx + 1}...{C_RESET}")
+                time.sleep(args.inter_run_cooldown_s)
     except KeyboardInterrupt:
         print(f"\n{C_YELLOW}Interrupted by user. Halting simulation runs.{C_RESET}")
 

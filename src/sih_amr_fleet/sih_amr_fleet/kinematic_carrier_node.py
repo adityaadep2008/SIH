@@ -12,11 +12,13 @@ Replaces Gazebo wheel physics with a deterministic kinematic motion model:
 7. Publishes hidden true_pose solely for benchmark validation and telemetry.
 """
 
+import collections
 import concurrent.futures
 import math
 import os
 import pathlib
 import random
+import threading
 import time
 import yaml
 from typing import Dict, List, Optional, Set, Tuple
@@ -99,11 +101,22 @@ class KinematicCarrierNode(Node):
         self.session_id = new_session_id()
         self.telemetry_sequence = 0
         self.gz_sync_total_count = 0
+        self.gz_sync_success_count = 0
         self.gz_sync_error_count = 0
+        self.gz_sync_rejected_count = 0
+        self.gz_sync_timeout_count = 0
+        self.gz_latency_history = collections.deque(maxlen=250)
+        self.gz_success_latency_history = collections.deque(maxlen=250)
         self.last_gz_latency_ms = 0.0
         self.max_gz_latency_ms = 0.0
         self.gz_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.gz_future = None
+        self._gz_lock = threading.Lock()
+        self._pending_gz_vector = None
+        self._last_gz_dispatch_time = 0.0
+        self._last_gz_dispatch_wall_time = 0.0
+        self._fleet_was_moving = False
+        self._force_gz_sync = False
         
         # Load map geometry for swept footprint collision checking
         self.map_resolution = 0.5
@@ -269,6 +282,7 @@ class KinematicCarrierNode(Node):
                     if p.id != 0 and self.gz_entity_ids.get(rid) != p.id:
                         self.gz_entity_ids[rid] = p.id
                         self.get_logger().info(f'Resolved Gazebo entity ID for {rid} ({p.name}) -> {p.id}')
+                        self._force_gz_sync = True
 
     def _is_position_collision_free(self, robot_id: str, x: float, y: float, curr_x: Optional[float] = None, curr_y: Optional[float] = None) -> bool:
         """Check if a circular footprint at (x, y) intersects shelves, walls, or other AMRs.
@@ -425,10 +439,35 @@ class KinematicCarrierNode(Node):
             self._publish_odometry(robot, dt, v, w)
             self._check_anchor_proximity(robot)
 
-        # Dispatch batch pose update to Gazebo via non-blocking background worker
+        # Adaptive dispatch rate: 20 Hz when any robot is in motion, 2 Hz when stationary
+        # Uses wall-clock monotonic time to prevent 5-6x rate amplification during unthrottled simulation
+        wall_now = time.monotonic()
+        any_moving = any(
+            abs(r.cmd_linear_x) > 0.001 or abs(r.cmd_angular_z) > 0.001 or
+            abs(r.true_vx) > 0.001 or abs(r.true_wz) > 0.001
+            for r in self.robots.values()
+        )
+        if any_moving != self._fleet_was_moving:
+            self._force_gz_sync = True
+            self._fleet_was_moving = any_moving
+
+        target_interval = 0.05 if any_moving else 0.50
+        time_since_last = wall_now - self._last_gz_dispatch_wall_time
+        should_dispatch = self._force_gz_sync or (time_since_last >= target_interval)
+
+        # Dispatch batch pose update to Gazebo via adaptive non-blocking worker with coalescing
         if gz_pose_vector is not None and len(gz_pose_vector.pose) > 0 and self.gz_executor is not None:
-            if self.gz_future is None or self.gz_future.done():
-                self.gz_future = self.gz_executor.submit(self._dispatch_gz_pose, gz_pose_vector)
+            with self._gz_lock:
+                if should_dispatch:
+                    self._pending_gz_vector = gz_pose_vector
+                    self._force_gz_sync = False
+                    self._last_gz_dispatch_time = now_s
+                    self._last_gz_dispatch_wall_time = wall_now
+
+                if (self.gz_future is None or self.gz_future.done()) and self._pending_gz_vector is not None:
+                    to_send = self._pending_gz_vector
+                    self._pending_gz_vector = None
+                    self.gz_future = self.gz_executor.submit(self._dispatch_gz_pose, to_send)
 
         # Publish true pose telemetry for validation
         self._publish_telemetry_true_poses()
@@ -437,17 +476,26 @@ class KinematicCarrierNode(Node):
         """Execute Gazebo set_pose_vector request in background worker to prevent choking the motion timer."""
         t0 = time.perf_counter()
         self.gz_sync_total_count += 1
+        res = False
+        rep = None
         try:
             res, rep = self.gz_node.request(
                 f'/world/{self.world_name}/set_pose_vector',
                 gz_pose_vector,
                 GzPose_V,
                 GzBoolean,
-                timeout=10
+                timeout=100
             )
-            if not (res and rep is not None and rep.data):
+            if res and rep is not None and rep.data:
+                self.gz_sync_success_count += 1
+            else:
                 self.gz_sync_error_count += 1
-                err_kind = 'rejected' if (res and rep is not None and not rep.data) else 'timeout/unreachable'
+                if res and rep is not None and not rep.data:
+                    self.gz_sync_rejected_count += 1
+                    err_kind = 'rejected'
+                else:
+                    self.gz_sync_timeout_count += 1
+                    err_kind = 'timeout/unreachable'
                 self.get_logger().warning(
                     f'[Carrier] Gazebo set_pose_vector failed ({err_kind}). '
                     f'Sync failures: {self.gz_sync_error_count}/{self.gz_sync_total_count}.',
@@ -455,15 +503,48 @@ class KinematicCarrierNode(Node):
                 )
         except Exception as e:
             self.gz_sync_error_count += 1
+            self.gz_sync_timeout_count += 1
             self.get_logger().warning(
                 f'[Carrier] Exception in Gazebo set_pose_vector: {e}. '
                 f'Sync failures: {self.gz_sync_error_count}/{self.gz_sync_total_count}.',
                 throttle_duration_sec=5.0
             )
         lat_ms = (time.perf_counter() - t0) * 1000.0
+        self.gz_latency_history.append(lat_ms)
+        if res and rep is not None and rep.data:
+            self.gz_success_latency_history.append(lat_ms)
         self.last_gz_latency_ms = lat_ms
         if lat_ms > self.max_gz_latency_ms:
             self.max_gz_latency_ms = lat_ms
+
+        # Periodic forensic telemetry log (every 250 requests)
+        if self.gz_sync_total_count % 250 == 0:
+            if len(self.gz_success_latency_history) > 0:
+                sorted_succ = sorted(self.gz_success_latency_history)
+                p50 = sorted_succ[len(sorted_succ) // 2]
+                p95 = sorted_succ[int(len(sorted_succ) * 0.95)]
+                max_succ = sorted_succ[-1]
+                lat_str = f"Latency (success) p50: {p50:.1f}ms, p95: {p95:.1f}ms, max: {max_succ:.1f}ms"
+            elif len(self.gz_latency_history) > 0:
+                sorted_lat = sorted(self.gz_latency_history)
+                p50 = sorted_lat[len(sorted_lat) // 2]
+                p95 = sorted_lat[int(len(sorted_lat) * 0.95)]
+                lat_str = f"Latency p50: {p50:.1f}ms, p95: {p95:.1f}ms, max: {self.max_gz_latency_ms:.1f}ms"
+            else:
+                lat_str = f"Latency max: {self.max_gz_latency_ms:.1f}ms"
+
+            any_moving = any(
+                abs(r.cmd_linear_x) > 0.001 or abs(r.cmd_angular_z) > 0.001 or
+                abs(r.true_vx) > 0.001 or abs(r.true_wz) > 0.001
+                for r in self.robots.values()
+            )
+            motion_str = "MOVING" if any_moving else "STATIONARY"
+            succ_pct = (self.gz_sync_success_count / max(1, self.gz_sync_total_count)) * 100.0
+            self.get_logger().info(
+                f'[Carrier Telemetry] Total: {self.gz_sync_total_count}, Success: {self.gz_sync_success_count} ({succ_pct:.1f}%), '
+                f'Timeouts: {self.gz_sync_timeout_count}, Rejections: {self.gz_sync_rejected_count}, '
+                f'{lat_str}, Fleet: {motion_str}'
+            )
 
     def _publish_odometry(self, robot: RobotKinematicState, dt: float, cmd_v: float, cmd_w: float):
         """Publish standard nav_msgs/Odometry for localization_node."""
@@ -549,7 +630,7 @@ class KinematicCarrierNode(Node):
 
     def destroy_node(self):
         if hasattr(self, 'gz_executor') and self.gz_executor:
-            self.gz_executor.shutdown(wait=False)
+            self.gz_executor.shutdown(wait=True, cancel_futures=True)
         super().destroy_node()
 
 
