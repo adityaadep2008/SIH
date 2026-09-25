@@ -117,6 +117,17 @@ class KinematicCarrierNode(Node):
         self._last_gz_dispatch_wall_time = 0.0
         self._fleet_was_moving = False
         self._force_gz_sync = False
+        self.gz_request_timeout_ms = 10
+        self.moving_dispatch_interval_s = 0.02
+        self.stationary_dispatch_interval_s = 0.50
+
+        # Rolling telemetry tracking
+        self._last_gz_success_wall_time = time.monotonic()
+        self._gz_success_intervals = collections.deque(maxlen=250)
+        self._gz_total_timeout_wait_s = 0.0
+        self._gz_telemetry_window_start_wall = time.monotonic()
+        self._gz_telemetry_window_attempts = 0
+        self._gz_telemetry_window_successes = 0
         
         # Load map geometry for swept footprint collision checking
         self.map_resolution = 0.5
@@ -439,8 +450,8 @@ class KinematicCarrierNode(Node):
             self._publish_odometry(robot, dt, v, w)
             self._check_anchor_proximity(robot)
 
-        # Adaptive dispatch rate: 20 Hz when any robot is in motion, 2 Hz when stationary
-        # Uses wall-clock monotonic time to prevent 5-6x rate amplification during unthrottled simulation
+        # Adaptive dispatch rate: 50 Hz ceiling (0.02s) when moving, 2 Hz (0.50s) when stationary
+        # Uses wall-clock monotonic time to prevent rate amplification during unthrottled simulation
         wall_now = time.monotonic()
         any_moving = any(
             abs(r.cmd_linear_x) > 0.001 or abs(r.cmd_angular_z) > 0.001 or
@@ -451,7 +462,7 @@ class KinematicCarrierNode(Node):
             self._force_gz_sync = True
             self._fleet_was_moving = any_moving
 
-        target_interval = 0.05 if any_moving else 0.50
+        target_interval = self.moving_dispatch_interval_s if any_moving else self.stationary_dispatch_interval_s
         time_since_last = wall_now - self._last_gz_dispatch_wall_time
         should_dispatch = self._force_gz_sync or (time_since_last >= target_interval)
 
@@ -475,7 +486,9 @@ class KinematicCarrierNode(Node):
     def _dispatch_gz_pose(self, gz_pose_vector):
         """Execute Gazebo set_pose_vector request in background worker to prevent choking the motion timer."""
         t0 = time.perf_counter()
+        t0_wall = time.monotonic()
         self.gz_sync_total_count += 1
+        self._gz_telemetry_window_attempts += 1
         res = False
         rep = None
         try:
@@ -484,10 +497,15 @@ class KinematicCarrierNode(Node):
                 gz_pose_vector,
                 GzPose_V,
                 GzBoolean,
-                timeout=100
+                timeout=int(self.gz_request_timeout_ms)
             )
             if res and rep is not None and rep.data:
                 self.gz_sync_success_count += 1
+                self._gz_telemetry_window_successes += 1
+                wall_now = time.monotonic()
+                if self._last_gz_success_wall_time > 0:
+                    self._gz_success_intervals.append(wall_now - self._last_gz_success_wall_time)
+                self._last_gz_success_wall_time = wall_now
             else:
                 self.gz_sync_error_count += 1
                 if res and rep is not None and not rep.data:
@@ -495,6 +513,7 @@ class KinematicCarrierNode(Node):
                     err_kind = 'rejected'
                 else:
                     self.gz_sync_timeout_count += 1
+                    self._gz_total_timeout_wait_s += (time.monotonic() - t0_wall)
                     err_kind = 'timeout/unreachable'
                 self.get_logger().warning(
                     f'[Carrier] Gazebo set_pose_vector failed ({err_kind}). '
@@ -504,6 +523,7 @@ class KinematicCarrierNode(Node):
         except Exception as e:
             self.gz_sync_error_count += 1
             self.gz_sync_timeout_count += 1
+            self._gz_total_timeout_wait_s += (time.monotonic() - t0_wall)
             self.get_logger().warning(
                 f'[Carrier] Exception in Gazebo set_pose_vector: {e}. '
                 f'Sync failures: {self.gz_sync_error_count}/{self.gz_sync_total_count}.',
@@ -519,6 +539,23 @@ class KinematicCarrierNode(Node):
 
         # Periodic forensic telemetry log (every 250 requests)
         if self.gz_sync_total_count % 250 == 0:
+            now_wall = time.monotonic()
+            window_dt = max(1e-4, now_wall - self._gz_telemetry_window_start_wall)
+            attempt_rate = self._gz_telemetry_window_attempts / window_dt
+            success_rate = self._gz_telemetry_window_successes / window_dt
+            self._gz_telemetry_window_start_wall = now_wall
+            self._gz_telemetry_window_attempts = 0
+            self._gz_telemetry_window_successes = 0
+
+            # Success interval percentiles (ms)
+            if len(self._gz_success_intervals) > 0:
+                sorted_intervals = sorted(self._gz_success_intervals)
+                int_p50_ms = sorted_intervals[len(sorted_intervals) // 2] * 1000.0
+                int_p95_ms = sorted_intervals[int(len(sorted_intervals) * 0.95)] * 1000.0
+                int_str = f"Interv p50: {int_p50_ms:.1f}ms, p95: {int_p95_ms:.1f}ms"
+            else:
+                int_str = "Interv: N/A"
+
             if len(self.gz_success_latency_history) > 0:
                 sorted_succ = sorted(self.gz_success_latency_history)
                 p50 = sorted_succ[len(sorted_succ) // 2]
@@ -541,8 +578,9 @@ class KinematicCarrierNode(Node):
             motion_str = "MOVING" if any_moving else "STATIONARY"
             succ_pct = (self.gz_sync_success_count / max(1, self.gz_sync_total_count)) * 100.0
             self.get_logger().info(
-                f'[Carrier Telemetry] Total: {self.gz_sync_total_count}, Success: {self.gz_sync_success_count} ({succ_pct:.1f}%), '
-                f'Timeouts: {self.gz_sync_timeout_count}, Rejections: {self.gz_sync_rejected_count}, '
+                f'[Carrier Telemetry] Total: {self.gz_sync_total_count}, Succ: {self.gz_sync_success_count} ({succ_pct:.1f}%), '
+                f'Rate: {attempt_rate:.1f} att/s, {success_rate:.1f} succ/s, '
+                f'{int_str}, Timeout wait: {self._gz_total_timeout_wait_s:.1f}s, '
                 f'{lat_str}, Fleet: {motion_str}'
             )
 

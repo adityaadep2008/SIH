@@ -370,8 +370,8 @@ def test_latest_snapshot_coalescing():
             rclpy.shutdown()
 
 
-def test_gz_request_deadline_is_100ms():
-    """Verify that _dispatch_gz_pose uses a bounded 100ms timeout parameter."""
+def test_gz_request_deadline_is_10ms():
+    """Verify that _dispatch_gz_pose uses the calibrated baseline 10ms timeout parameter."""
     import rclpy
     from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
 
@@ -382,6 +382,7 @@ def test_gz_request_deadline_is_100ms():
 
     try:
         node = KinematicCarrierNode()
+        assert node.gz_request_timeout_ms == 10
 
         captured_kwargs = {}
 
@@ -394,7 +395,7 @@ def test_gz_request_deadline_is_100ms():
         node.gz_node = MockGzNode()
         node._dispatch_gz_pose("mock_vector")
 
-        assert captured_kwargs.get('timeout') == 100
+        assert captured_kwargs.get('timeout') == 10
 
         node.destroy_node()
     finally:
@@ -430,7 +431,51 @@ def test_inter_run_cooldown_argument_parsing():
 
 
 def test_production_simulation_step_adaptive_throttling():
-    """Directly execute node._simulation_step() to verify production wall-clock rate limiting and triggers."""
+    """Directly execute node._simulation_step() to verify production 50 Hz moving / 2 Hz stationary limits."""
+    import time
+    from unittest.mock import MagicMock
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+        assert node.moving_dispatch_interval_s == 0.02
+        assert node.stationary_dispatch_interval_s == 0.50
+
+        mock_gz = MagicMock()
+        mock_gz.request.return_value = (True, MagicMock(data=True))
+        node.gz_node = mock_gz
+        node.gz_entity_ids['robot_1'] = 101
+
+        # 1. First step while stationary: triggers force_gz_sync because _fleet_was_moving=False
+        node._last_gz_dispatch_wall_time = time.monotonic()
+        node._force_gz_sync = False
+
+        # Immediate step within 10ms should NOT dispatch (stationary interval is 0.50s)
+        initial_count = node.gz_sync_total_count
+        node._simulation_step()
+        assert node.gz_sync_total_count == initial_count
+
+        # 2. Accelerate robot: next _simulation_step() detects transition -> triggers immediate dispatch
+        node.robots['robot_1'].cmd_linear_x = 0.46
+        node._simulation_step()
+        assert node._fleet_was_moving is True
+        assert node._force_gz_sync is False
+        assert node.gz_future is not None
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
+
+def test_carrier_wall_clock_throughput_ceiling():
+    """Verify that moving fleet dispatch obeys the 50 Hz wall-clock ceiling (interval >= 0.02s)."""
     import time
     from unittest.mock import MagicMock
     import rclpy
@@ -447,23 +492,21 @@ def test_production_simulation_step_adaptive_throttling():
         mock_gz.request.return_value = (True, MagicMock(data=True))
         node.gz_node = mock_gz
         node.gz_entity_ids['robot_1'] = 101
-
-        # 1. First step while stationary: triggers force_gz_sync because _fleet_was_moving=False
-        node._last_gz_dispatch_wall_time = time.monotonic()
+        node.robots['robot_1'].cmd_linear_x = 0.46
+        node._fleet_was_moving = True
         node._force_gz_sync = False
 
-        # Immediate step within 10ms should NOT dispatch (stationary interval is 0.50s)
-        initial_count = node.gz_sync_total_count
-        node._simulation_step()
-        # Should not have submitted a new request because < 0.50s
-        assert node.gz_sync_total_count == initial_count
+        # Set last dispatch time to right now
+        now = time.monotonic()
+        node._last_gz_dispatch_wall_time = now
 
-        # 2. Accelerate robot: next _simulation_step() detects transition -> triggers immediate dispatch
-        node.robots['robot_1'].cmd_linear_x = 0.46
+        # Immediately call _simulation_step(): time_since_last is ~0s (< 0.02s), should not dispatch
         node._simulation_step()
-        assert node._fleet_was_moving is True
-        assert node._force_gz_sync is False
-        # Request should have been submitted
+        assert node.gz_future is None
+
+        # Simulate 0.025s passing
+        node._last_gz_dispatch_wall_time = now - 0.025
+        node._simulation_step()
         assert node.gz_future is not None
 
         node.destroy_node()
@@ -561,6 +604,53 @@ def test_periodic_telemetry_disaggregated_latency():
     finally:
         if shutdown_at_end:
             rclpy.shutdown()
+
+
+def test_periodic_telemetry_enhanced_metrics():
+    """Verify that success intervals and timeout wait time are recorded."""
+    import time
+    import rclpy
+    from sih_amr_fleet.kinematic_carrier_node import KinematicCarrierNode
+
+    shutdown_at_end = False
+    if not rclpy.ok():
+        rclpy.init()
+        shutdown_at_end = True
+
+    try:
+        node = KinematicCarrierNode()
+
+        class MockGzNode:
+            def __init__(self):
+                self.fail_next = False
+            def request(self, *args, **kwargs):
+                if self.fail_next:
+                    time.sleep(0.005)
+                    return (False, None)
+                class MockRep:
+                    data = True
+                return (True, MockRep())
+
+        mock_gz = MockGzNode()
+        node.gz_node = mock_gz
+
+        # 1. Success request
+        node._dispatch_gz_pose("mock_vector")
+        assert node.gz_sync_success_count == 1
+        assert len(node._gz_success_intervals) == 1
+        assert node._gz_telemetry_window_successes == 1
+
+        # 2. Timeout request
+        mock_gz.fail_next = True
+        node._dispatch_gz_pose("mock_vector")
+        assert node.gz_sync_timeout_count == 1
+        assert node._gz_total_timeout_wait_s > 0.0
+
+        node.destroy_node()
+    finally:
+        if shutdown_at_end:
+            rclpy.shutdown()
+
 
 
 
