@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AM-CORD AI | SIH 2026 Pitch Deck</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="deck-toolbar" aria-label="Pitch deck controls">
+      <strong>AM-CORD AI</strong>
+      <span>SIH 2026 pitch deck</span>
+      <button type="button" onclick="window.print()">Print or save as PDF</button>
+    </header>
+
+    <main class="deck" aria-label="AM-CORD AI pitch deck">
+      <article class="slide" aria-label="Slide 1: Cover">
+        <div class="slide-canvas">
+          <img class="slide-base" src="assets/slide-1.png" alt="AM-CORD AI Smart India Hackathon 2026 cover slide" />
+        </div>
+      </article>
+
+      <article class="slide slide-2" aria-label="Slide 2: Proposed solution">
+        <div class="slide-canvas">
+        <img class="slide-base" src="assets/slide-2.png" alt="AM-CORD AI proposed solution" />
+        <section class="s2-safety-copy">
+          <span class="s2-bullet">•</span><p><strong>Deterministic Safety-First Architecture:</strong> CO-WHCA* trajectory reservations, corridor leases, ORCA and the LiDAR-based Safety Supervisor verify every AI recommendation before execution.</p>
+        </section>
+
+        <section class="s2-answer answer-1">
+          <p>Robots make decisions locally and share state through Zenoh-assisted ROS 2 communication. A router improves startup discovery without becoming a fleet decision controller.</p>
+        </section>
+        <section class="s2-answer answer-2">
+          <p>CBBA works like an auction. Each robot calculates a completion cost, then the fleet agrees on one winner before assigning the task.</p>
+        </section>
+        <section class="s2-answer answer-3">
+          <p>ML estimates travel time and congestion. CO-WHCA* then verifies the route against short time-space reservations so robots avoid conflicting paths.</p>
+        </section>
+        <section class="s2-answer answer-4">
+          <p>One AMR receives an exclusive lease for a narrow aisle. ORCA adjusts motion in real time, while LiDAR safety can slow or stop the robot.</p>
+        </section>
+        </div>
+      </article>
+
+      <article class="slide slide-3" aria-label="Slide 3: Technical approach">
+        <div class="slide-canvas">
+        <img class="slide-base" src="assets/slide-3.png" alt="AM-CORD AI technical approach" />
+        <section class="s3-step zenoh-step">
+          <strong>2. Zenoh-Assisted ROS 2 Coordination</strong>
+          <span>Router-assisted discovery with Cyclone DDS fallback</span>
+        </section>
+        <section class="s3-step cowhca-step">
+          <strong>7. CO-WHCA* Space-Time and Corridor Mutex</strong>
+          <span>Short reservation windows and single-aisle access control</span>
+        </section>
+        <section class="s3-stack">
+          <strong>Tools and software:</strong> ROS 2 Jazzy, Gazebo Harmonic, Eclipse Zenoh (<code>rmw_zenoh_cpp</code>), Cyclone DDS fallback, WebSockets, Ubuntu 24.04 LTS.<br />
+          <strong>AI roadmap:</strong> Python, PyTorch, YOLOv8, LightGBM/XGBoost ETA models and MAPPO reinforcement learning.<br />
+          <strong>Target hardware:</strong> Raspberry Pi 4 / Jetson-class edge devices, TurtleBot 4, 2D LiDAR and optional RGB-D camera.
+        </section>
+        </div>
+      </article>
+
+      <article class="slide slide-4" aria-label="Slide 4: Feasibility and viability">
+        <div class="slide-canvas">
+        <img class="slide-base" src="assets/slide-4.png" alt="AM-CORD AI feasibility and viability" />
+        <section class="s4-autonomy">
+          <strong>Implemented Autonomy</strong>
+          <p>CBBA task allocation, CO-WHCA* time-space planning, trajectory reservations, distributed corridor access, ORCA, LiDAR safety veto, obstacle rerouting, docking, battery simulation and telemetry logging.</p>
+        </section>
+        <section class="s4-solution zenoh-solution">
+          <span>Zenoh supports router-assisted discovery for dense ROS 2 process graphs. Robots keep local planning and safety authority; Cyclone DDS remains a fallback.</span>
+        </section>
+        <section class="s4-solution cowhca-solution">
+          <span>ML ETA predictions act as a soft cost for CBBA bidding and CO-WHCA* route selection. If confidence is low or inference fails, deterministic planning takes over.</span>
+        </section>
+        </div>
+      </article>
+
+      <article class="slide slide-5" aria-label="Slide 5: Impact and benefits">
+        <div class="slide-canvas">
+        <img class="slide-base" src="assets/slide-5.png" alt="AM-CORD AI impact and benefits" />
+        <section class="s5-zenoh-copy">
+          <strong>Decentralized autonomy:</strong> AMRs retain local planning and safety authority. Zenoh reduces dense-process startup discovery through router registrations; the dashboard is not a control dependency.
+        </section>
+        <section class="s5-zenoh-benchmark">
+          <strong>Zenoh-Assisted Discovery</strong><br />
+          <span>O(N) router registrations vs. O(N²) DDS peer discovery</span>
+        </section>
+        </div>
+      </article>
+
+      <article class="slide slide-6" aria-label="Slide 6: Research and references">
+        <div class="slide-canvas">
+        <img class="slide-base" src="assets/slide-6.png" alt="AM-CORD AI research and references" />
+        <section class="s6-zenoh-reference">
+          <span>Decentralized middleware: OMG DDS v1.4 / Eclipse Zenoh 1.0. Current deployment uses router-assisted discovery with Zenoh.</span>
+        </section>
+        </div>
+      </article>
+    </main>
+  </body>
+</html>
